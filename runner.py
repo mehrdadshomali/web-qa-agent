@@ -139,8 +139,9 @@ def visit_page(browser, request_ctx, url, base_host, screenshots_dir, status_cac
         "auth_required": False,
         "exception": None,
         "console_messages": [],
-        "broken_resources": [],
-        "vite_hmr_assets": [],
+        "site_resources": [],         # host == base_host -> GERÇEK kırık kaynak
+        "third_party_resources": [],  # dış hostlar (GA, GTM, fonts, fb, vb.)
+        "vite_hmr_assets": [],        # localhost:5173 -> dev-server / HMR
         "broken_links": [],
         "broken_images": [],
         "forms": [],
@@ -158,30 +159,42 @@ def visit_page(browser, request_ctx, url, base_host, screenshots_dir, status_cac
     page.on("pageerror", lambda exc: console_messages.append(
         {"type": "pageerror", "text": str(exc)}))
 
-    # Başarısız / 4xx-5xx ağ istekleri (kırık kaynaklar)
+    # Başarısız ağ isteklerini host'a göre sınıflandır:
+    #  - site_resource  : host == base_host -> GERÇEK kırık kaynak
+    #  - vite_hmr        : localhost:5173    -> dev-server / HMR varlığı
+    #  - third_party     : diğer tüm dış hostlar (GA, GTM, fonts, fb, vb.)
+    # status=None (engellenmiş/başarısız dış beacon) da bu sınıflandırmaya girer.
+    def classify_failed(entry):
+        host = urlparse(entry["url"]).netloc
+        if host in VITE_HMR_HOSTS:
+            entry["category"] = "vite_hmr"
+            result["vite_hmr_assets"].append(entry)
+        elif host == base_host:
+            entry["category"] = "site_resource"
+            result["site_resources"].append(entry)
+        else:
+            entry["category"] = "third_party"
+            result["third_party_resources"].append(entry)
+
     def on_response(resp):
         try:
             if resp.status >= 400:
-                host = urlparse(resp.url).netloc
-                entry = {"url": resp.url, "status": resp.status,
-                         "resource_type": resp.request.resource_type}
-                if host in VITE_HMR_HOSTS:
-                    result["vite_hmr_assets"].append(entry)
-                else:
-                    result["broken_resources"].append(entry)
+                classify_failed({
+                    "url": resp.url,
+                    "status": resp.status,
+                    "resource_type": resp.request.resource_type,
+                })
         except Exception:
             pass
 
     def on_requestfailed(req):
         try:
-            host = urlparse(req.url).netloc
-            entry = {"url": req.url, "status": None,
-                     "failure": (req.failure or "request failed"),
-                     "resource_type": req.resource_type}
-            if host in VITE_HMR_HOSTS:
-                result["vite_hmr_assets"].append(entry)
-            else:
-                result["broken_resources"].append(entry)
+            classify_failed({
+                "url": req.url,
+                "status": None,
+                "failure": (req.failure or "request failed"),
+                "resource_type": req.resource_type,
+            })
         except Exception:
             pass
 
@@ -379,7 +392,8 @@ def main():
         if m["type"] in ("error", "pageerror"))
     broken_refs = sum(len(f["broken_links"]) + len(f["broken_images"]) for f in findings)
     broken_unique = len(broken_targets_list)
-    broken_resources = sum(len(f["broken_resources"]) for f in findings)
+    site_resources = sum(len(f["site_resources"]) for f in findings)
+    third_party = sum(len(f["third_party_resources"]) for f in findings)
     vite_hmr = sum(len(f["vite_hmr_assets"]) for f in findings)
     auth_skipped = sum(1 for f in findings if f["auth_required"])
     total_forms = sum(len(f["forms"]) for f in findings)
@@ -392,7 +406,8 @@ def main():
     print(f"  Yüklenemeyen sayfa       : {load_failed}")
     print(f"  Konsol hatası (toplam)   : {console_errors}")
     print(f"  Kırık hedef              : {broken_unique} benzersiz ({broken_refs} referans)")
-    print(f"  Kırık kaynak (CSS/JS/img): {broken_resources}")
+    print(f"  Kırık kaynak (site)      : {site_resources}")
+    print(f"  Başarısız istek (dış/3P) : {third_party}")
     print(f"  Vite/HMR varlık uyarısı  : {vite_hmr}")
     print(f"  Auth nedeniyle atlanan   : {auth_skipped}")
     print(f"  Bulunan form sayısı      : {total_forms}")
