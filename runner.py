@@ -17,7 +17,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urldefrag, urlparse
+from urllib.parse import urljoin, urldefrag, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, Error as PlaywrightError
@@ -43,8 +43,27 @@ INTER_PAGE_DELAY_S = 0.4     # sayfalar arası küçük gecikme
 
 VITE_HMR_HOSTS = {"localhost:5173", "127.0.0.1:5173"}
 
+# Tarayıcıyla "sayfa" olarak açılmayacak, indirilebilir dosya uzantıları.
+DOWNLOAD_EXTENSIONS = (
+    ".pdf", ".zip", ".rar", ".7z", ".gz", ".tar",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".csv", ".mp4", ".mp3", ".wav", ".mov", ".dmg", ".exe", ".apk",
+)
+
 
 # --- Yardımcılar -----------------------------------------------------------
+
+def strip_query(url):
+    """Query string ve fragment'i atarak URL'i path bazında normalize et.
+    /etkinlikler?sort=a ve /etkinlikler?sort=b -> aynı normalize URL."""
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
+def is_downloadable(url):
+    """Path bilinen bir indirme uzantısıyla bitiyor mu?"""
+    path = urlparse(url).path.lower()
+    return path.endswith(DOWNLOAD_EXTENSIONS)
 
 def normalize_url(href, base_url):
     """Göreli linki mutlaklaştır, fragment'i at. Crawl edilemez şema ise None döner."""
@@ -136,6 +155,8 @@ def visit_page(browser, request_ctx, url, base_host, screenshots_dir, status_cac
         "final_url": None,
         "status": None,
         "load_failed": False,
+        "downloadable": None,         # {"status": int|None} -> indirilebilir dosya, hata değil
+        "query_variants_seen": [],    # bu path'in görülen query varyantları (sadece ilki ziyaret edilir)
         "auth_required": False,
         "exception": None,
         "console_messages": [],
@@ -148,6 +169,12 @@ def visit_page(browser, request_ctx, url, base_host, screenshots_dir, status_cac
         "screenshot": None,
     }
     discovered_internal = []
+
+    # İndirilebilir dosyalar: tarayıcıyla "sayfa" olarak açma; sadece hafif
+    # HEAD/GET ile HTTP durumunu al ve "downloadable" olarak kaydet (hata değil).
+    if is_downloadable(url):
+        result["downloadable"] = {"status": check_target_status(request_ctx, url, status_cache)}
+        return result, discovered_internal
 
     context = browser.new_context(ignore_https_errors=True)
     page = context.new_page()
@@ -212,10 +239,14 @@ def visit_page(browser, request_ctx, url, base_host, screenshots_dir, status_cac
         context.close()
         return result, discovered_internal
     except PlaywrightError as e:
-        result["load_failed"] = True
         result["console_messages"] = console_messages
-        result["error"] = str(e)
         context.close()
+        # Uzantısız ama indirme tetikleyen uçlar: "Download is starting" -> hata değil.
+        if "Download is starting" in str(e):
+            result["downloadable"] = {"status": check_target_status(request_ctx, url, status_cache)}
+        else:
+            result["load_failed"] = True
+            result["error"] = str(e)
         return result, discovered_internal
 
     final_url = page.url
@@ -324,8 +355,13 @@ def main():
 
         browser = p.chromium.launch(headless=True)
 
+        # Query string'i atılmış (path-bazlı) normalize URL'lerle benzersizleştir:
+        # /etkinlikler?sort=a ve ?sort=b aynı sayfa sayılır, sadece ilki ziyaret edilir.
+        start = strip_query(base_url)
         visited = set()
-        queue = deque([base_url])
+        queued = {start}                 # kuyrukta/işlenmiş normalize URL'ler (O(1) kontrol)
+        queue = deque([start])
+        query_variants = {}              # normalize URL -> görülen query varyantları seti
         findings = []
         status_cache = {}
 
@@ -340,12 +376,19 @@ def main():
             print(f"[{len(visited):>3}/{args.max_pages}] Ziyaret: {url}")
             result, discovered = visit_page(
                 browser, request_ctx, url, base_host, screenshots_dir, status_cache)
+            # Bu path için görülen query varyantlarını kayda ekle (bilgi kaybetme).
+            result["query_variants_seen"] = sorted(query_variants.get(url, set()))
             findings.append(result)
 
             if not result["auth_required"]:
                 for link in discovered:
-                    if link not in visited and link not in queue:
-                        queue.append(link)
+                    norm = strip_query(link)
+                    q = urlparse(link).query
+                    if q:
+                        query_variants.setdefault(norm, set()).add(q)
+                    if norm not in queued:
+                        queued.add(norm)
+                        queue.append(norm)
 
             time.sleep(INTER_PAGE_DELAY_S)
 
@@ -372,12 +415,21 @@ def main():
                     t["found_on_pages"].append(f["url"])
     broken_targets_list = list(broken_targets.values())
 
+    # İndirilebilir dosyaları ayrı kategoride topla (yüklenemeyen sayfa DEĞİL).
+    downloadable_files = [
+        {"url": f["url"], "status": f["downloadable"].get("status")}
+        for f in findings if f["downloadable"]
+    ]
+
     # Çıktıyı yaz
+    limit_reached = len(visited) >= args.max_pages and len(queue) > 0
     output = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "base_url": base_url,
         "pages_visited": len(findings),
+        "max_pages_limit_reached": limit_reached,
         "broken_targets": broken_targets_list,
+        "downloadable_files": downloadable_files,
         "pages": findings,
     }
     findings_path = reports_dir / "findings.json"
@@ -398,12 +450,14 @@ def main():
     auth_skipped = sum(1 for f in findings if f["auth_required"])
     total_forms = sum(len(f["forms"]) for f in findings)
 
+    limit_note = "SINIRA ULAŞILDI (daha fazla sayfa var)" if limit_reached else "tüm yüzey kapsandı"
     print("\n" + "=" * 60)
     print("ÖZET")
     print("=" * 60)
-    print(f"  Gezilen sayfa            : {len(findings)}")
+    print(f"  Gezilen benzersiz path   : {len(findings)}  -> {limit_note}")
     print(f"  2xx olmayan durum        : {non_2xx}")
     print(f"  Yüklenemeyen sayfa       : {load_failed}")
+    print(f"  İndirilebilir dosya      : {len(downloadable_files)}")
     print(f"  Konsol hatası (toplam)   : {console_errors}")
     print(f"  Kırık hedef              : {broken_unique} benzersiz ({broken_refs} referans)")
     print(f"  Kırık kaynak (site)      : {site_resources}")
