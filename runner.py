@@ -339,11 +339,32 @@ def main():
         browser.close()
         request_ctx.dispose()
 
+    # Kırık link/görselleri benzersiz HEDEF bazında topla (rapor şişmesin).
+    # Aynı kırık URL (ör. menüdeki /kariyer) birçok sayfada tekrar geçtiği için
+    # sayfa-bazlı kayıtlar şişik görünür; burada benzersiz hedefe indirgenir.
+    # Sayfa-bazlı kayıtlar (f["broken_links"]/["broken_images"]) AYNEN kalır.
+    broken_targets = {}
+    for f in findings:
+        for kind, items in (("link", f["broken_links"]), ("image", f["broken_images"])):
+            for b in items:
+                t = broken_targets.setdefault(b["url"], {
+                    "url": b["url"],
+                    "status": b["status"],
+                    "kind": kind,
+                    "reference_count": 0,   # toplam kaç kez referans verildi
+                    "found_on_pages": [],   # hangi sayfalarda göründü
+                })
+                t["reference_count"] += 1
+                if f["url"] not in t["found_on_pages"]:
+                    t["found_on_pages"].append(f["url"])
+    broken_targets_list = list(broken_targets.values())
+
     # Çıktıyı yaz
     output = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "base_url": base_url,
         "pages_visited": len(findings),
+        "broken_targets": broken_targets_list,
         "pages": findings,
     }
     findings_path = reports_dir / "findings.json"
@@ -356,7 +377,8 @@ def main():
     console_errors = sum(
         1 for f in findings for m in f["console_messages"]
         if m["type"] in ("error", "pageerror"))
-    broken_links = sum(len(f["broken_links"]) + len(f["broken_images"]) for f in findings)
+    broken_refs = sum(len(f["broken_links"]) + len(f["broken_images"]) for f in findings)
+    broken_unique = len(broken_targets_list)
     broken_resources = sum(len(f["broken_resources"]) for f in findings)
     vite_hmr = sum(len(f["vite_hmr_assets"]) for f in findings)
     auth_skipped = sum(1 for f in findings if f["auth_required"])
@@ -369,11 +391,14 @@ def main():
     print(f"  2xx olmayan durum        : {non_2xx}")
     print(f"  Yüklenemeyen sayfa       : {load_failed}")
     print(f"  Konsol hatası (toplam)   : {console_errors}")
-    print(f"  Kırık link/görsel        : {broken_links}")
+    print(f"  Kırık hedef              : {broken_unique} benzersiz ({broken_refs} referans)")
     print(f"  Kırık kaynak (CSS/JS/img): {broken_resources}")
     print(f"  Vite/HMR varlık uyarısı  : {vite_hmr}")
     print(f"  Auth nedeniyle atlanan   : {auth_skipped}")
     print(f"  Bulunan form sayısı      : {total_forms}")
+    print("=" * 60)
+    print("  Not: aynı sayfanın 500 hatası birden çok kategoride sayılabilir")
+    print("       (kırık link + 2xx-olmayan sayfa + konsol hatası).")
     print("=" * 60)
     print(f"\nRapor: {findings_path}")
     print(f"Ekran görüntüleri: {screenshots_dir}\n")
