@@ -11,6 +11,7 @@ Bağımlılıklar: playwright, beautifulsoup4
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -20,6 +21,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urldefrag, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -28,8 +30,29 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 # Durum değiştiren / auth / ödeme kalıpları — bu URL'ler crawl edilmez.
 SKIP_PATTERNS = re.compile(
-    r"(logout|signout|sign-out|delete|destroy|remove|edit|checkout|payment|"
-    r"\bpay\b|cart|purchase|ticket|subscribe|unsubscribe)",
+    r"("
+    # --- İngilizce (durum-değiştiren / auth / ödeme) ---
+    r"logout|signout|sign-out|delete|destroy|remove|edit|checkout|payment|"
+    r"\bpay\b|cart|add-to-cart|purchase|ticket|subscribe|unsubscribe|"
+    # --- Türkçe: sepet / ödeme / satın alma / fatura ---
+    r"sepet|sepete-ekle|odeme|ödeme|fatura|satin|satın|"
+    # --- Türkçe: abonelik — SADECE aksiyon biçimleri; içerik kategorisi
+    #     'abonelik-eglence' yanlışlıkla atlanmasın diye bare 'abonelik' YOK ---
+    r"abone-ol|abonelik-iptal|abonelikten|"
+    # --- Türkçe: düzenleme / değiştirme / güncelleme ---
+    r"duzenle|düzenle|degistir|değiştir|guncelle|güncelle|"
+    # --- Türkçe: çıkış / oturum kapatma (KRİTİK: ajan kendi oturumunu kapatmasın) ---
+    r"cikis|çıkış|oturumu-kapat|oturum-kapat|"
+    # --- Türkçe: bilet ---
+    r"bilet|"
+    # --- Türkçe: silme — literal 'silme' + segment-sınırlı 'sil'
+    #     (böylece 'nasil', 'nesil', 'temsil' gibi masum slug'lar ATLANMAZ) ---
+    r"silme|(?<![a-z])sil(?![a-z])|"
+    # --- Türkçe: kaldırma — segment-sınırlı ('kaldirim' korunur) ---
+    r"(?<![a-z])kald[ıi]r(?![a-z])|"
+    # --- Türkçe: topluluk/kulüpten ayrılma — segment-sınırlı ('ayrilik' korunur) ---
+    r"(?<![a-z])ayr[ıi]l(?![a-z])"
+    r")",
     re.IGNORECASE,
 )
 
@@ -148,8 +171,10 @@ def check_target_status(request_ctx, url, status_cache):
     return status
 
 
-def visit_page(browser, request_ctx, url, base_host, screenshots_dir, status_cache):
-    """Tek bir sayfayı ziyaret et, salt-okunur veri topla. Bulunan iç linkleri döndür."""
+def visit_page(browser, request_ctx, url, base_host, screenshots_dir, status_cache,
+               auth_state=None):
+    """Tek bir sayfayı ziyaret et, salt-okunur veri topla. Bulunan iç linkleri döndür.
+    auth_state verilirse (login sonrası cookie'ler) context authenticated olur."""
     result = {
         "url": url,
         "final_url": None,
@@ -176,7 +201,7 @@ def visit_page(browser, request_ctx, url, base_host, screenshots_dir, status_cac
         result["downloadable"] = {"status": check_target_status(request_ctx, url, status_cache)}
         return result, discovered_internal
 
-    context = browser.new_context(ignore_https_errors=True)
+    context = browser.new_context(ignore_https_errors=True, storage_state=auth_state)
     page = context.new_page()
     page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
 
@@ -319,6 +344,45 @@ def visit_page(browser, request_ctx, url, base_host, screenshots_dir, status_cac
     return result, discovered_internal
 
 
+# --- Login (salt-okunur istisna) -------------------------------------------
+
+def do_login(browser, base_url, email, password):
+    """SALT-OKUNUR İSTİSNA: yalnızca /login formunu doldurup gönderir.
+
+    Başka hiçbir form doldurulmaz/gönderilmez. CSRF token elle scrape edilmez —
+    form @csrf içerir ve Playwright submit edince tarayıcı token/cookie'yi taşır.
+    (basari, storage_state, final_url) döner.
+    """
+    login_url = base_url + "/login"
+    context = browser.new_context(ignore_https_errors=True)
+    page = context.new_page()
+    page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+    try:
+        page.goto(login_url, wait_until="load")
+        page.wait_for_timeout(ALPINE_WAIT_MS)  # Alpine init
+        page.fill('input[name="email"]', email)
+        page.fill('input[name="password"]', password)
+        # Formu Playwright submit etsin (tarayıcı CSRF token/cookie'yi kendi taşır).
+        try:
+            with page.expect_navigation(wait_until="load", timeout=NAV_TIMEOUT_MS):
+                page.click('button[type="submit"]')
+        except PlaywrightTimeoutError:
+            pass  # yönlendirme olmayabilir; başarıyı aşağıda URL/logout ile belirleriz
+        page.wait_for_timeout(ALPINE_WAIT_MS)
+    except PlaywrightError as e:
+        context.close()
+        return False, None, str(e)
+
+    final_url = page.url
+    on_login_page = AUTH_URL_PATTERNS.search(urlparse(final_url).path) is not None
+    has_logout = page.query_selector(
+        'a[href*="logout"], form[action*="logout"], a[href*="signout"]') is not None
+    success = (not on_login_page) or has_logout
+    state = context.storage_state()
+    context.close()
+    return success, state, final_url
+
+
 # --- Çalıştırıcı -----------------------------------------------------------
 
 def main():
@@ -328,6 +392,9 @@ def main():
                         help="Base URL (varsayılan: http://localhost:8080)")
     parser.add_argument("--max-pages", type=int, default=50,
                         help="Gezilecek maksimum sayfa (varsayılan: 50)")
+    parser.add_argument("--login", action="store_true",
+                        help="Crawl'dan önce QA test hesabıyla login ol (auth arkası "
+                             "youth sayfaları da taranır). .env: QA_LOGIN_EMAIL/PASSWORD")
     args = parser.parse_args()
 
     base_url = args.url.rstrip("/")
@@ -355,6 +422,35 @@ def main():
 
         browser = p.chromium.launch(headless=True)
 
+        # Opsiyonel login (salt-okunur istisna: sadece /login formu).
+        auth_state = None
+        login_status = "kapalı"
+        if args.login:
+            load_dotenv(Path(__file__).parent / ".env")
+            email = os.environ.get("QA_LOGIN_EMAIL", "test-youth@qa.local").strip()
+            password = os.environ.get("QA_LOGIN_PASSWORD", "")
+            if not password:
+                print("\n[HATA] --login verildi ama QA_LOGIN_PASSWORD .env'de yok.")
+                print("       web-qa-agent/.env dosyasına QA_LOGIN_PASSWORD=... ekleyin.\n")
+                browser.close()
+                request_ctx.dispose()
+                sys.exit(1)
+            print(f"[login] Giriş deneniyor: {email} ...")
+            ok, auth_state, final_url = do_login(browser, base_url, email, password)
+            if not ok:
+                login_status = "başarısız"
+                print("\n[HATA] Login başarısız — email/şifre .env'de doğru mu, hesap active mi?")
+                print(f"       Giriş sonrası URL: {final_url}\n")
+                browser.close()
+                request_ctx.dispose()
+                sys.exit(1)
+            login_status = "başarılı"
+            print(f"[login] Başarılı. Oturum korunuyor. (URL: {final_url})")
+            # HEAD/link durum kontrolleri de authenticated olsun:
+            request_ctx.dispose()
+            request_ctx = p.request.new_context(ignore_https_errors=True,
+                                                storage_state=auth_state)
+
         # Query string'i atılmış (path-bazlı) normalize URL'lerle benzersizleştir:
         # /etkinlikler?sort=a ve ?sort=b aynı sayfa sayılır, sadece ilki ziyaret edilir.
         start = strip_query(base_url)
@@ -375,7 +471,8 @@ def main():
 
             print(f"[{len(visited):>3}/{args.max_pages}] Ziyaret: {url}")
             result, discovered = visit_page(
-                browser, request_ctx, url, base_host, screenshots_dir, status_cache)
+                browser, request_ctx, url, base_host, screenshots_dir, status_cache,
+                auth_state)
             # Bu path için görülen query varyantlarını kayda ekle (bilgi kaybetme).
             result["query_variants_seen"] = sorted(query_variants.get(url, set()))
             findings.append(result)
@@ -426,6 +523,7 @@ def main():
     output = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "base_url": base_url,
+        "login": login_status,
         "pages_visited": len(findings),
         "max_pages_limit_reached": limit_reached,
         "broken_targets": broken_targets_list,
@@ -454,6 +552,7 @@ def main():
     print("\n" + "=" * 60)
     print("ÖZET")
     print("=" * 60)
+    print(f"  Login durumu             : {login_status}")
     print(f"  Gezilen benzersiz path   : {len(findings)}  -> {limit_note}")
     print(f"  2xx olmayan durum        : {non_2xx}")
     print(f"  Yüklenemeyen sayfa       : {load_failed}")
