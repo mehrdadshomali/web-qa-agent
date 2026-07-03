@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 import os
 
 MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 4096
+MAX_TOKENS = 8192
 # Fiyatlandırma (USD / 1M token) — maliyet tahmini için.
 PRICE_INPUT_PER_M = 3.00
 PRICE_OUTPUT_PER_M = 15.00
@@ -95,8 +95,52 @@ def distill(findings):
                 continue
             real_console_errors.append({"page": p["url"], "type": m["type"], "text": m["text"]})
 
+    # --- Erişilebilirlik: KURAL bazında topla (ham node listeleri GÖNDERİLMEZ) ---
+    a11y_rules = {}
+    for p in pages:
+        for v in (p.get("accessibility") or []):
+            r = a11y_rules.setdefault(v["id"], {
+                "rule": v["id"],
+                "impact": v.get("impact"),
+                "description": v.get("description"),
+                "total_nodes": 0,
+                "pages_affected": 0,
+            })
+            r["total_nodes"] += v.get("nodes", 0)
+            r["pages_affected"] += 1
+    _impact_order = {"critical": 0, "serious": 1, "moderate": 2, "minor": 3}
+    a11y_rules_sorted = sorted(
+        a11y_rules.values(),
+        key=lambda r: (_impact_order.get(r["impact"], 9), -r["total_nodes"]),
+    )
+    by_impact = {"critical": 0, "serious": 0, "moderate": 0, "minor": 0, "other": 0}
+    for r in a11y_rules_sorted:
+        imp = r["impact"] if r["impact"] in by_impact else "other"
+        by_impact[imp] += r["pages_affected"]
+    accessibility_summary = {
+        "total_violations": sum(r["pages_affected"] for r in a11y_rules_sorted),
+        "by_impact": by_impact,
+        "rules": a11y_rules_sorted,  # önem + yaygınlık sırasında, en fazla ~12 kural
+    }
+
+    # --- Performans: yalnızca en ağır 5 sayfa + genel ortalamalar ---
+    perf = [(p["url"], p["performance"]) for p in pages
+            if p.get("performance") and p["performance"].get("transferred_bytes")]
+    loads = [pf["load_ms"] for _, pf in perf if pf.get("load_ms")]
+    performance_summary = {
+        "pages_measured": len(perf),
+        "avg_load_ms": round(sum(loads) / len(loads)) if loads else None,
+        "total_transferred_mb": round(sum(pf["transferred_bytes"] for _, pf in perf) / 1024 / 1024, 1),
+        "heaviest_pages": [
+            {"url": u, "transferred_kb": round(pf["transferred_bytes"] / 1024),
+             "requests": pf.get("request_count"), "load_ms": pf.get("load_ms")}
+            for u, pf in sorted(perf, key=lambda x: -x[1]["transferred_bytes"])[:5]
+        ],
+    }
+
     return {
         "base_url": findings["base_url"],
+        "scan_date": findings.get("generated_at"),  # gerçek tarama tarihi (ISO); rapor bunu kullanmalı
         "unique_paths_crawled": len(pages),
         "max_pages_limit_reached": findings.get("max_pages_limit_reached"),
         "auth_required_skipped": sum(1 for p in pages if p.get("auth_required")),
@@ -105,6 +149,8 @@ def distill(findings):
         "site_broken_resources": list(site_resources.values()),
         "external_dependency_observations": list(external_observations.values()),
         "real_console_errors": real_console_errors,
+        "accessibility_summary": accessibility_summary,
+        "performance_summary": performance_summary,
     }
 
 
@@ -113,11 +159,27 @@ uygulamasının salt-okunur tarama bulgularının kompakt bir özeti (JSON) veri
 
 Görevin: bulguları analiz edip TEMİZ, BAŞLIKLI bir Markdown raporu üret. Şunları yap:
 1. Bulguları önem sırasına diz: ## Kritik / ## Orta / ## Düşük başlıkları altında.
+   Kırık sayfalar/kaynaklar, ERİŞİLEBİLİRLİK ihlalleri ve PERFORMANS sorunlarının
+   HEPSİNİ bu önem seviyelerine dahil et (ör. site genelinde critical a11y ihlali =
+   Kritik/Orta; ağır bir sayfa = Orta/Düşük).
 2. Mümkün olan her yerde KÖK NEDEN açıkla (ör. bir 500'ün veritabanında eksik bir
    kolondan kaynaklanması → muhtemelen eksik/uygulanmamış bir migration).
 3. Her bulgu için SOMUT bir düzeltme önerisi ver.
+   - Erişilebilirlik için: kısa WCAG bağlamı ver (hangi başarı kriteri) ve pratik
+     düzeltme (ör. button-name → ikon-butonlara aria-label; image-alt → alt metni;
+     color-contrast → kontrast oranını 4.5:1'e çıkar). Kural site genelinde
+     tekrarlıyorsa (çok sayfada) bunu tema/bileşen düzeyinde tek düzeltme olarak öner.
+   - Performans için: somut öneri ver (ör. ana sayfa 7.8 MB → görselleri optimize
+     et/WebP + lazy-load, Three.js/GSAP paketini böl, gereksiz istekleri azalt).
 4. Raporun sonunda "## İyileştirme ve Yeni Özellik Fikirleri" başlığı altında
    birkaç fikir sun.
+
+Girdideki 'accessibility_summary' kural bazında damıtılmıştır (rule id + impact +
+toplam öğe + kaç sayfada); ham node listesi yoktur. 'performance_summary' yalnızca
+en ağır 5 sayfayı ve genel ortalamaları içerir. Bunları olduğu gibi kullan.
+
+Rapor tarihini sana verilen gerçek 'scan_date' değerinden al (ISO tarih-saat; yalnızca
+tarih kısmını göstermen yeterli), ASLA uydurma. scan_date yoksa tarih satırı ekleme.
 
 Sadece verilen bulgulara dayan; veri uydurma. Türkçe yaz. Çıktı yalnızca Markdown olsun."""
 
@@ -182,6 +244,32 @@ def local_fallback_report(summary):
     if summary["external_dependency_observations"]:
         for e in summary["external_dependency_observations"]:
             lines.append(f"- [{e['status']}] {e['url']}")
+    else:
+        lines.append("- Yok")
+    lines.append("")
+
+    a11y = summary.get("accessibility_summary") or {}
+    lines.append("## Erişilebilirlik (WCAG A+AA, kural bazında)")
+    if a11y.get("rules"):
+        bi = a11y.get("by_impact", {})
+        lines.append(f"Toplam {a11y.get('total_violations', 0)} ihlal "
+                     f"(critical={bi.get('critical',0)}, serious={bi.get('serious',0)}, "
+                     f"moderate={bi.get('moderate',0)}, minor={bi.get('minor',0)})")
+        for r in a11y["rules"]:
+            lines.append(f"- **{r['rule']}** [{r['impact']}] — {r['pages_affected']} sayfada, "
+                         f"{r['total_nodes']} öğe — {r.get('description','')}")
+    else:
+        lines.append("- Yok")
+    lines.append("")
+
+    perf = summary.get("performance_summary") or {}
+    lines.append("## Performans (en ağır sayfalar)")
+    if perf.get("heaviest_pages"):
+        lines.append(f"Ortalama yükleme {perf.get('avg_load_ms')} ms | toplam "
+                     f"{perf.get('total_transferred_mb')} MB ({perf.get('pages_measured')} sayfa)")
+        for hp in perf["heaviest_pages"]:
+            lines.append(f"- {hp['transferred_kb']} KB | {hp['requests']} istek | "
+                         f"{hp['load_ms']} ms — {hp['url']}")
     else:
         lines.append("- Yok")
     lines.append("")
