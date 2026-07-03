@@ -66,6 +66,11 @@ INTER_PAGE_DELAY_S = 0.4     # sayfalar arası küçük gecikme
 
 VITE_HMR_HOSTS = {"localhost:5173", "127.0.0.1:5173"}
 
+# axe-core (vendored, npm gerektirmez) — erişilebilirlik denetimi.
+# Çalışma anında dış istek yok; JS dosyadan add_script_tag ile enjekte edilir.
+AXE_PATH = Path(__file__).parent / "vendor" / "axe.min.js"
+AXE_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"]  # WCAG 2.0/2.1 A + AA
+
 # Tarayıcıyla "sayfa" olarak açılmayacak, indirilebilir dosya uzantıları.
 DOWNLOAD_EXTENSIONS = (
     ".pdf", ".zip", ".rar", ".7z", ".gz", ".tar",
@@ -171,6 +176,65 @@ def check_target_status(request_ctx, url, status_cache):
     return status
 
 
+# --- Erişilebilirlik + performans ölçümü (salt-okunur) -----------------------
+
+def run_accessibility(page):
+    """axe-core'u sayfaya enjekte edip WCAG (2.0/2.1 A+AA) ihlallerini toplar.
+
+    Salt-okunur: yalnızca DOM'u analiz eder, kalıcı değişiklik yapmaz. axe dosyası
+    yoksa, CSP enjeksiyonu engellerse veya başka bir hata olursa zarifçe None döner
+    (crawl'ı bozmaz). Her ihlal: {id, impact, description, nodes}.
+    """
+    if not AXE_PATH.exists():
+        return None
+    try:
+        page.add_script_tag(path=str(AXE_PATH))
+        return page.evaluate(
+            """async (tags) => {
+                const r = await axe.run(document, {
+                    runOnly: { type: 'tag', values: tags },
+                    resultTypes: ['violations'],
+                });
+                return r.violations.map(v => ({
+                    id: v.id,
+                    impact: v.impact,
+                    description: v.help,
+                    nodes: v.nodes.length,
+                }));
+            }""",
+            AXE_TAGS,
+        )
+    except Exception:
+        return None
+
+
+def collect_performance(page):
+    """Hafif performans metrikleri (Lighthouse'suz) — Performance API üzerinden.
+
+    load_ms, dom_content_loaded_ms, transferred_bytes, request_count.
+    NOT: İleride tam Lighthouse skorları (performance/SEO/best-practices) BU
+    fonksiyona eklenebilir; ayrı tutulması bunu kolaylaştırmak içindir.
+    """
+    try:
+        return page.evaluate(
+            """() => {
+                const nav = performance.getEntriesByType('navigation')[0] || {};
+                const res = performance.getEntriesByType('resource') || [];
+                let bytes = nav.transferSize || 0;
+                for (const r of res) bytes += (r.transferSize || 0);
+                const ms = (a, b) => (a && b != null) ? Math.round(a - b) : null;
+                return {
+                    load_ms: ms(nav.loadEventEnd, nav.startTime),
+                    dom_content_loaded_ms: ms(nav.domContentLoadedEventEnd, nav.startTime),
+                    transferred_bytes: bytes,
+                    request_count: res.length + 1,  // +1: belge isteğinin kendisi
+                };
+            }"""
+        )
+    except Exception:
+        return None
+
+
 def visit_page(browser, request_ctx, url, base_host, screenshots_dir, status_cache,
                auth_state=None):
     """Tek bir sayfayı ziyaret et, salt-okunur veri topla. Bulunan iç linkleri döndür.
@@ -190,6 +254,8 @@ def visit_page(browser, request_ctx, url, base_host, screenshots_dir, status_cac
         "vite_hmr_assets": [],        # localhost:5173 -> dev-server / HMR
         "broken_links": [],
         "broken_images": [],
+        "accessibility": None,        # axe-core WCAG ihlalleri listesi
+        "performance": None,          # hafif perf metrikleri (Lighthouse'suz)
         "forms": [],
         "screenshot": None,
     }
@@ -288,6 +354,11 @@ def visit_page(browser, request_ctx, url, base_host, screenshots_dir, status_cac
         result["exception"] = extract_exception_info(html)
 
     soup = BeautifulSoup(html, "html.parser")
+
+    # Erişilebilirlik (axe-core) + performans — salt-okunur ölçüm, DOM'u kalıcı
+    # değiştirmez, form göndermez. (Faz 3 adım 3)
+    result["accessibility"] = run_accessibility(page)
+    result["performance"] = collect_performance(page)
 
     # Form envanteri (SADECE tespit, gönderme yok)
     for form in soup.find_all("form"):
@@ -548,6 +619,21 @@ def main():
     auth_skipped = sum(1 for f in findings if f["auth_required"])
     total_forms = sum(len(f["forms"]) for f in findings)
 
+    # Erişilebilirlik (axe) — önem kırılımıyla toplam ihlal.
+    a11y_impacts = {"critical": 0, "serious": 0, "moderate": 0, "minor": 0, "other": 0}
+    a11y_total = 0
+    for f in findings:
+        for v in (f.get("accessibility") or []):
+            a11y_total += 1
+            imp = v.get("impact") or "other"
+            a11y_impacts[imp if imp in a11y_impacts else "other"] += 1
+    # Performans — ortalama yükleme süresi ve toplam transfer.
+    load_times = [f["performance"]["load_ms"] for f in findings
+                  if f.get("performance") and f["performance"].get("load_ms")]
+    avg_load = round(sum(load_times) / len(load_times)) if load_times else None
+    total_kb = sum((f["performance"] or {}).get("transferred_bytes", 0)
+                   for f in findings if f.get("performance")) / 1024
+
     limit_note = "SINIRA ULAŞILDI (daha fazla sayfa var)" if limit_reached else "tüm yüzey kapsandı"
     print("\n" + "=" * 60)
     print("ÖZET")
@@ -564,6 +650,10 @@ def main():
     print(f"  Vite/HMR varlık uyarısı  : {vite_hmr}")
     print(f"  Auth nedeniyle atlanan   : {auth_skipped}")
     print(f"  Bulunan form sayısı      : {total_forms}")
+    print(f"  Erişilebilirlik ihlali   : {a11y_total}  "
+          f"(critical={a11y_impacts['critical']}, serious={a11y_impacts['serious']}, "
+          f"moderate={a11y_impacts['moderate']}, minor={a11y_impacts['minor']})")
+    print(f"  Ort. yükleme / transfer  : {avg_load} ms | {total_kb:.0f} KB toplam")
     print("=" * 60)
     print("  Not: aynı sayfanın 500 hatası birden çok kategoride sayılabilir")
     print("       (kırık link + 2xx-olmayan sayfa + konsol hatası).")
