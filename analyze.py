@@ -162,17 +162,32 @@ Görevin: bulguları analiz edip TEMİZ, BAŞLIKLI bir Markdown raporu üret. Ş
    Kırık sayfalar/kaynaklar, ERİŞİLEBİLİRLİK ihlalleri ve PERFORMANS sorunlarının
    HEPSİNİ bu önem seviyelerine dahil et (ör. site genelinde critical a11y ihlali =
    Kritik/Orta; ağır bir sayfa = Orta/Düşük).
-2. Mümkün olan her yerde KÖK NEDEN açıkla (ör. bir 500'ün veritabanında eksik bir
-   kolondan kaynaklanması → muhtemelen eksik/uygulanmamış bir migration).
+2. KÖK NEDEN çıkarımı yap ama bunun bir TAHMİN olduğunu dille belli et
+   ("muhtemelen", "olası neden", "doğrulanması gerekir"). Aşağıdaki
+   "KESİN TESPİT vs TAHMİN" kuralına harfiyen uy.
 3. Her bulgu için SOMUT bir düzeltme önerisi ver.
+   - Öneri bir TAHMİNE dayanıyorsa başına kısa bir "Önce doğrula" adımı koy
+     (ör. "Önce N+1 olup olmadığını Laravel Debugbar/Telescope ile doğrulayın, sonra...").
    - Erişilebilirlik için: kısa WCAG bağlamı ver (hangi başarı kriteri) ve pratik
      düzeltme (ör. button-name → ikon-butonlara aria-label; image-alt → alt metni;
      color-contrast → kontrast oranını 4.5:1'e çıkar). Kural site genelinde
      tekrarlıyorsa (çok sayfada) bunu tema/bileşen düzeyinde tek düzeltme olarak öner.
    - Performans için: somut öneri ver (ör. ana sayfa 7.8 MB → görselleri optimize
-     et/WebP + lazy-load, Three.js/GSAP paketini böl, gereksiz istekleri azalt).
+     et/WebP + lazy-load, Three.js/GSAP paketini böl, gereksiz istekleri azalt) —
+     ancak ağırlığın SEBEBİ ölçülmediği için önce "sayfayı ne şişiriyor" doğrulanmalı.
 4. Raporun sonunda "## İyileştirme ve Yeni Özellik Fikirleri" başlığı altında
    birkaç fikir sun.
+
+KESİN TESPİT vs TAHMİN (çok önemli — ton kuralı):
+- TESPİTLER = findings.json'daki ÖLÇÜLEN veriler: HTTP durum kodları, hata
+  mesajları/istisna sınıfları, axe erişilebilirlik ihlalleri, sayfa ağırlığı (byte),
+  istek sayısı, yükleme süresi. Bunlar KESİN gerçeklerdir; kesin dille yaz.
+- KÖK NEDENLER ÇIKARIMDIR. Ajan sayfa ağırlığını ÖLÇTÜ ama SEBEBİNİ (Three.js mi,
+  büyük görsel mi, N+1 sorgu mu) DOĞRULAMADI. Kök nedenleri ASLA kesin dille yazma.
+- Ajan yalnızca DIŞARIDAN (tarayıcı) gözlem yaptı; KAYNAK KODA veya VERİTABANINA
+  BAKMADI. Sunucu-tarafı tahminlerini (N+1 sorgu, migration durumu, git deployment,
+  hangi JS kütüphanesinin yüklü olduğu vb.) "kontrol edilmeli" çerçevesinde öner;
+  "şöyledir/şundandır" diye kesin ifade ETME.
 
 Girdideki 'accessibility_summary' kural bazında damıtılmıştır (rule id + impact +
 toplam öğe + kaç sayfada); ham node listesi yoktur. 'performance_summary' yalnızca
@@ -180,6 +195,11 @@ en ağır 5 sayfayı ve genel ortalamaları içerir. Bunları olduğu gibi kulla
 
 Rapor tarihini sana verilen gerçek 'scan_date' değerinden al (ISO tarih-saat; yalnızca
 tarih kısmını göstermen yeterli), ASLA uydurma. scan_date yoksa tarih satırı ekleme.
+
+Raporun EN BAŞINA (ana başlık ve tarih/özet satırlarından hemen sonra) şu notu AYNEN ekle:
+> **Not:** Tespitler otomatik tarama ile ölçülmüştür ve kesindir. Kök neden analizleri
+> ve düzeltme önerileri, dış gözleme dayalı çıkarımlardır; uygulanmadan önce ilgili
+> geliştirici tarafından doğrulanmalıdır.
 
 Sadece verilen bulgulara dayan; veri uydurma. Türkçe yaz. Çıktı yalnızca Markdown olsun."""
 
