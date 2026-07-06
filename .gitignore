@@ -1,4 +1,5 @@
 venv/
 .env
 reports/
+logs/
 __pycache__/

@@ -76,7 +76,66 @@ Her sayfa için toplananlar:
 > Bulgular `reports/findings.json` içindedir; bu README aracı anlatır, bulguları
 > içermez. `reports/` ve `venv/` git'e dahil edilmez.
 
-## Kapsam dışı (sonraki fazlar)
+## Faz 4: Haftalık otomatik çalışma (launchd)
 
-Claude API, rapor üretici, Lighthouse, erişilebilirlik, Telegram ve zamanlama
-Faz 1'e dahil değildir.
+`weekly_run.py`, `run_qa()` ile tam taramayı (login, max 200) yapıp sonucu
+Telegram'a gönderen tek-seferlik bir scripttir. macOS `launchd` ile haftada bir
+tetiklenir.
+
+### Kurulum
+
+```bash
+# 1) plist'i LaunchAgents'a kopyala (yollar makineye özgü — plist içindekilerle eşleşmeli)
+cp deploy/com.badinext.qa-weekly.plist ~/Library/LaunchAgents/
+
+# 2) yükle (her Pazartesi 09:00'da çalışacak şekilde kaydeder)
+launchctl load -w ~/Library/LaunchAgents/com.badinext.qa-weekly.plist
+
+# durum:
+launchctl list | grep qa-weekly
+```
+
+### Elle test (kurulumu doğrulamak için hemen bir kez çalıştır)
+
+```bash
+# launchd üzerinden tetikle:
+launchctl start com.badinext.qa-weekly
+#   veya modern söz dizimi:
+launchctl kickstart -k gui/$(id -u)/com.badinext.qa-weekly
+
+# ya da doğrudan (launchd olmadan):
+venv/bin/python weekly_run.py
+```
+
+Sonuç Telegram'a düşer (özet + `report.md`). Çalışma geçmişi:
+`logs/weekly.log`; launchd job çıktısı: `logs/launchd.out.log` / `logs/launchd.err.log`.
+
+### Kaldırma
+
+```bash
+launchctl unload -w ~/Library/LaunchAgents/com.badinext.qa-weekly.plist
+```
+
+### ⚠️ Mac uyku / kapalı durumu (önemli)
+
+- **Mac uyanık:** job zamanında (Pzt 09:00) çalışır.
+- **Mac uykuda:** `launchd`, `StartCalendarInterval` için kaçırılan çalışmayı Mac
+  **uyanınca bir kez** çalıştırır (varsayılan davranış; ekstra ayar gerekmez).
+- **Mac tamamen KAPALI:** çalışma **garanti değildir**. Bu yüzden **o saatte Mac'in
+  açık (uyanık ya da uykuda) olması gerekir** — kapalıysa o haftalık tarama atlanabilir.
+
+İsteğe bağlı: Mac'i her Pazartesi 08:55'te otomatik uyandırmak (sonra launchd 09:00'da
+tetikler) için:
+
+```bash
+sudo pmset repeat wakeorpoweron M 08:55:00
+```
+
+Bu, "her koşulda çalışır" garantisi vermez ama uyku senaryosunu güçlendirir.
+Kritik bir ortamda haftalık taramanın kaçmaması gerekiyorsa, sürekli açık bir
+sunucu/CI (cron) daha uygundur.
+
+## Kapsam dışı
+
+Şimdilik: brand/student_club/community rol taramaları ve tam Lighthouse skorları
+(performans hâlâ hafif metriklerle) sonraki fazlara bırakılmıştır.
