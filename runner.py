@@ -487,7 +487,7 @@ def main():
 
         if not reachable:
             print("\n[HATA] Base URL'e erişilemiyor: %s" % base_url)
-            print("       Önce badinext'te 'docker compose up' ile uygulamayı başlat.\n")
+            print("       Önce hedef uygulamayı ('docker compose up' vb. ile) başlatın.\n")
             request_ctx.dispose()
             sys.exit(1)
 

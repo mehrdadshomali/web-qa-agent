@@ -1,38 +1,38 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  web-qa-agent — haftalık QA taraması (launchd LaunchAgent).
+  web-qa-agent — haftalık QA taraması (launchd LaunchAgent, ÖRNEK).
 
   Her Pazartesi 09:00'da weekly_run.py'yi (venv python ile) çalıştırır.
 
+  ‼️ ÖNCE YOLLARI DÜZENLEYİN: aşağıdaki /path/to/web-qa-agent ifadelerini kendi
+     kurulum dizininizle değiştirin (ör. /Users/<kullanıcı>/web-qa-agent).
+
   Kurulum:
-    cp deploy/com.badinext.qa-weekly.plist ~/Library/LaunchAgents/
-    launchctl load -w ~/Library/LaunchAgents/com.badinext.qa-weekly.plist
+    cp deploy/com.example.qa-weekly.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.example.qa-weekly.plist
 
   Elle test (hemen bir kez çalıştır):
-    launchctl start com.badinext.qa-weekly
+    launchctl start com.example.qa-weekly
     # veya modern:
-    launchctl kickstart -k gui/$(id -u)/com.badinext.qa-weekly
+    launchctl kickstart -k gui/$(id -u)/com.example.qa-weekly
 
   Durdurma/kaldırma:
-    launchctl unload -w ~/Library/LaunchAgents/com.badinext.qa-weekly.plist
-
-  NOT: Aşağıdaki yollar bu makineye özgüdür (/Users/mehrdadshomali/...).
-       Farklı bir kullanıcı/dizinde kullanacaksan hepsini güncelle.
+    launchctl unload -w ~/Library/LaunchAgents/com.example.qa-weekly.plist
 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.badinext.qa-weekly</string>
+    <string>com.example.qa-weekly</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/mehrdadshomali/web-qa-agent/venv/bin/python</string>
-        <string>/Users/mehrdadshomali/web-qa-agent/weekly_run.py</string>
+        <string>/path/to/web-qa-agent/venv/bin/python</string>
+        <string>/path/to/web-qa-agent/weekly_run.py</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/mehrdadshomali/web-qa-agent</string>
+    <string>/path/to/web-qa-agent</string>
 
     <!-- Her Pazartesi 09:00 (Weekday: 0/7=Pazar, 1=Pazartesi ... 6=Cumartesi) -->
     <key>StartCalendarInterval</key>
@@ -47,9 +47,9 @@
 
     <!-- launchd job'un çıktısı (weekly_run zaten logs/weekly.log'a ayrıca yazar) -->
     <key>StandardOutPath</key>
-    <string>/Users/mehrdadshomali/web-qa-agent/logs/launchd.out.log</string>
+    <string>/path/to/web-qa-agent/logs/launchd.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/mehrdadshomali/web-qa-agent/logs/launchd.err.log</string>
+    <string>/path/to/web-qa-agent/logs/launchd.err.log</string>
 
     <!-- Yüklerken hemen çalışmasın; sadece takvim tetiklesin (elle test edeceğiz). -->
     <key>RunAtLoad</key>
