@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 import os
 
-from code_context import collect_code_context
+from code_context import collect_code_context, collect_route_code_context
 
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 8192
@@ -41,6 +41,8 @@ CONSOLE_NOISE = (
 
 # En fazla kaç farklı 500 için kod kanıtı toplanır (prompt şişmesin).
 CODE_EVIDENCE_MAX_500 = 5
+# En fazla kaç ağır sayfa için performans kod kanıtı toplanır.
+PERF_CODE_EVIDENCE_MAX = 3
 
 
 def collect_code_evidence(findings, target_repo_path):
@@ -75,6 +77,33 @@ def collect_code_evidence(findings, target_repo_path):
             })
         if len(evidence) >= CODE_EVIDENCE_MAX_500:
             break
+    return evidence
+
+
+def collect_performance_code_evidence(summary, target_repo_path):
+    """En ağır sayfalar için route -> controller/query kodunu (salt-okuma) topla.
+
+    performance_summary'deki en ağır ilk PERF_CODE_EVIDENCE_MAX sayfa için, o
+    route'u karşılayan controller metodunun kaynak kodu ve sorgu sinyalleri
+    (paginate yok / eager-load yok / N+1 riski) toplanır. TARGET_REPO_PATH yoksa
+    ya da route/metot eşleşmezse boş liste döner (eski 'tahmin' davranışına düşer).
+    """
+    if not target_repo_path:
+        return []
+    heaviest = (summary.get("performance_summary") or {}).get("heaviest_pages") or []
+    evidence = []
+    for hp in heaviest[:PERF_CODE_EVIDENCE_MAX]:
+        ctx = collect_route_code_context(hp["url"], target_repo_path)
+        if ctx.get("available") and ctx.get("snippet"):
+            evidence.append({
+                "url": hp["url"],
+                "transferred_kb": hp.get("transferred_kb"),
+                "requests": hp.get("requests"),
+                "load_ms": hp.get("load_ms"),
+                "route": ctx["route"],
+                "signals": ctx["signals"],
+                "snippet": ctx["snippet"],
+            })
     return evidence
 
 
@@ -245,6 +274,31 @@ KESİN TESPİT vs TAHMİN (çok önemli — ton kuralı):
   ('muhtemelen', 'doğrulanmalı') dil aynen geçerlidir. Yani: kanıt varsa KESİN,
   yoksa TEMKİNLİ.
 
+İSTİSNA — 'performance_code_evidence' (performans için kod-destekli teşhis):
+- Girdide bir ağır/yavaş sayfa için 'performance_code_evidence' verildiyse (o
+  sayfanın route'undan bulunan controller metodunun GERÇEK kaynak kodu + ölçülen
+  sorgu sinyalleri), o sayfanın performans KÖK NEDEN teşhisini ARTIK TAHMİN DEĞİL
+  kabul et: KESİN dille yaz ve hangi DOSYA:METOT'a (route.method_file /
+  route.controller@route.method) dayandığını AÇIKÇA belirt.
+- 'signals' ölçülen kod gerçekleridir: uses_all (Model::all() var mı), get_calls
+  (->get() sayısı), has_pagination (paginate/simplePaginate/cursorPaginate var mı),
+  has_eager_load (->with()/withCount eager-load var mı), has_chunk_or_cursor,
+  loop_count (foreach sayısı), where_has (whereHas sayısı). Teşhisi bunlara + snippet'e
+  dayandır. Örnekler:
+    * uses_all=true ve has_pagination=false → "X@index'te Model::all() ile tüm tablo
+      tek seferde belleğe yükleniyor; sayfalama yok" diye KESİN yaz.
+    * get_calls>0 ve has_pagination=false → büyük sonuç kümesi; paginate yok.
+    * has_eager_load=false ve (loop_count>0 veya where_has>0) → ilişkiler eager-load
+      edilmeden döngüde/koşulda kullanılıyor → N+1 sorgu (kod üzerinden KESİN göster).
+- Sayfa AĞIRLIĞININ (byte) tek başına kod kanıtıyla açıklanamayacağını unutma:
+  transfer boyutu görsel/JS kaynaklıysa bunu ayrı tut. Kod kanıtı SORGU/N+1 ve
+  yükleme süresi tarafını kesinleştirir; ham byte ağırlığının SEBEBİ (görsel/paket)
+  hâlâ ölçülmediyse o kısımda temkinli kal.
+- İKİ somut çözüm ver: (1) paginate()/simplePaginate() ekle ya da sonuç kümesini
+  sınırla; (2) ilişkileri ->with([...]) ile eager-load ederek N+1'i kır.
+- 'performance_code_evidence' VERİLMEYEN ağır sayfalarda eski TEMKİNLİ dil
+  ('muhtemelen N+1', 'doğrulanmalı') aynen geçerlidir.
+
 Girdideki 'accessibility_summary' kural bazında damıtılmıştır (rule id + impact +
 toplam öğe + kaç sayfada); ham node listesi yoktur. 'performance_summary' yalnızca
 en ağır 5 sayfayı ve genel ortalamaları içerir. Bunları olduğu gibi kullan.
@@ -252,6 +306,15 @@ en ağır 5 sayfayı ve genel ortalamaları içerir. Bunları olduğu gibi kulla
 'code_evidence' (varsa) her kod-destekli 500 için şu yapıdadır:
 {url, status, exception_class, code_root, snippets:[{file, line, terms, context}]}
 — 'context' ilgili kaynak kodun numaralı satırlarıdır. Teşhisi bunlara dayandır.
+
+'performance_code_evidence' (varsa) her ağır sayfa için şu yapıdadır:
+{url, transferred_kb, requests, load_ms,
+ route:{controller, method, method_file, method_line, route_file, route_line},
+ signals:{uses_all, get_calls, has_pagination, has_eager_load, has_chunk_or_cursor,
+ loop_count, where_has},
+ snippet:{file, line, context}}
+— 'context' controller metodunun ilgili numaralı satırlarıdır. Performans teşhisini
+buna dayandır.
 
 Rapor tarihini sana verilen gerçek 'scan_date' değerinden al (ISO tarih-saat; yalnızca
 tarih kısmını göstermen yeterli), ASLA uydurma. scan_date yoksa tarih satırı ekleme.
@@ -402,6 +465,14 @@ def main():
         print("[kod kanıtı] TARGET_REPO_PATH ayarlı ama 500 için kanıt bulunamadı.")
     else:
         print("[kod kanıtı] TARGET_REPO_PATH ayarlı değil — kanıt atlandı (tahmin modu).")
+
+    # Ağır sayfalar için performans kod kanıtı (route -> controller/query).
+    summary["performance_code_evidence"] = collect_performance_code_evidence(summary, target_repo)
+    if summary["performance_code_evidence"]:
+        print(f"[perf kod kanıtı] {len(summary['performance_code_evidence'])} ağır sayfa "
+              f"için controller/query kodu okundu.")
+    elif target_repo:
+        print("[perf kod kanıtı] ağır sayfalar için route/kod eşleşmesi bulunamadı.")
 
     # API'yi çağır; başarısız olursa yerel rapora düş.
     try:

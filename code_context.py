@@ -33,6 +33,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 # --- Güvenlik/sınır ayarları ---
 CODE_DIRS = ("app", "database", "routes")
@@ -50,6 +51,29 @@ CONTEXT_BEFORE = 4
 CONTEXT_AFTER = 6
 MAX_FILE_BYTES = 500_000
 MAX_TOTAL_BYTES = 6_000
+
+# --- Performans (route -> controller metodu) için ayarlar ---
+ROUTE_FILES = ("web.php", "auth.php")   # routes/ altında taranacak route dosyaları
+PERF_MAX_BODY_LINES = 400               # bir metot gövdesi için tarama üst sınırı
+PERF_MAX_SNIPPET_BYTES = 1_800          # ağır-sayfa kod parçası için bütçe
+
+# Route tanımı: Route::verb('/path', [\App\...\XController::class, 'method'])
+# (match/any için ilk arg dizi olabilir; verb dizisi opsiyonel atlanır.)
+ROUTE_DEF_RE = re.compile(
+    r"Route::(?P<verb>get|match|any|post|put|patch|delete)\(\s*"
+    r"(?:\[[^\]]*\]\s*,\s*)?"
+    r"['\"](?P<path>[^'\"]+)['\"]\s*,\s*"
+    r"\[\s*\\?(?P<ctrl>[\w\\]+)::class\s*,\s*['\"](?P<method>\w+)['\"]\s*\]",
+    re.DOTALL,
+)
+# Metot gövdesinde sinyal satırlarını (sorgu/ilişki) yakalar. Builder metotları
+# hem -> hem :: formunda; Eloquent get() request->get('x')'ten ayrılır (bkz.
+# _analyze_query_signals). request->get('param') snippet'te vurgulanmaz.
+PERF_SNIP_RE = re.compile(
+    r"(?:->|::)all\(|->get\(\s*(?:\)|\[)"
+    r"|(?:->|::)(?:paginate|simplePaginate|cursorPaginate|with|withCount|chunk|cursor|load)\("
+    r"|whereHas\(|::query\("
+)
 
 STOPWORDS = {
     "select", "count", "from", "where", "and", "or", "as", "is", "not", "null",
@@ -238,6 +262,189 @@ def collect_code_context(error_message, target_repo_path):
     return {"available": True, "reason": None, "code_root": str(code_root),
             "terms": {"specific": high, "generic": generic},
             "snippets": snippets, "truncated": trunc1 or trunc2}
+
+
+# --- Performans teşhisi: route -> controller metodu -> sorgu sinyalleri -------
+#
+# Bir URL'in route'unu bulur, karşılayan controller metodunu okur ve içindeki
+# Eloquent sorgu sinyallerini (::all(), ->get() vs paginate, ->with() eager-load,
+# foreach/whereHas -> N+1) çıkarır. SALT-OKUMA; sadece routes/*.php ve TEK bir
+# controller dosyası okunur (os.walk yok), MAX_FILE_BYTES ve hassas-dosya
+# kontrolleri aynen uygulanır.
+
+
+def _find_route(code_root, url):
+    """URL path'ini karşılayan controller route'unu döndür (yoksa None)."""
+    path = "/" + (urlparse(url).path or "/").strip("/")
+    routes_dir = code_root / "routes"
+    if not routes_dir.is_dir():
+        return None
+
+    matches = []
+    for fn in ROUTE_FILES:
+        f = routes_dir / fn
+        if not f.is_file() or _is_sensitive(fn):
+            continue
+        try:
+            if f.stat().st_size > MAX_FILE_BYTES:
+                continue
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in ROUTE_DEF_RE.finditer(text):
+            matches.append({
+                "verb": m.group("verb").lower(),
+                "path": "/" + m.group("path").strip("/"),
+                "controller": m.group("ctrl").lstrip("\\"),
+                "method": m.group("method"),
+                "route_file": f"routes/{fn}",
+                "route_line": text.count("\n", 0, m.start()) + 1,
+            })
+
+    def pick(cands):
+        gets = [c for c in cands if c["verb"] == "get"]
+        return (gets or cands)[0]
+
+    exact = [c for c in matches if c["path"] == path]
+    if exact:
+        return pick(exact)
+
+    # {param} wildcard ile segment-bazlı eşleşme (ör. /kariyer/{slug})
+    tseg = [s for s in path.split("/") if s]
+    patt = []
+    for c in matches:
+        cseg = [s for s in c["path"].split("/") if s]
+        if len(cseg) != len(tseg):
+            continue
+        if all(cs == ts or (cs.startswith("{") and cs.endswith("}"))
+               for cs, ts in zip(cseg, tseg)):
+            patt.append(c)
+    return pick(patt) if patt else None
+
+
+def _class_to_file(code_root, cls):
+    """App\\Http\\Controllers\\XController -> (rel, abs) veya None (PSR-4: App -> app)."""
+    parts = cls.lstrip("\\").split("\\")
+    if not parts or parts[0] != "App":
+        return None
+    rel = "/".join(["app"] + parts[1:]) + ".php"
+    f = code_root / rel
+    return (rel, f) if f.is_file() else None
+
+
+def _extract_method_body(lines, method):
+    """(start_idx, end_idx) — metot imzasından brace sayarak gövde. Bulunamazsa None.
+
+    Basit brace sayımı (string/comment içindeki süslüler ayıklanmaz); salt-okuma
+    teşhis için yeterli bir sezgiseldir ve PERF_MAX_BODY_LINES ile sınırlıdır.
+    """
+    sig_re = re.compile(r"\bfunction\s+" + re.escape(method) + r"\s*\(")
+    start = next((i for i, ln in enumerate(lines) if sig_re.search(ln)), None)
+    if start is None:
+        return None
+    depth, seen_open, end = 0, False, None
+    for i in range(start, min(len(lines), start + PERF_MAX_BODY_LINES)):
+        depth += lines[i].count("{") - lines[i].count("}")
+        if "{" in lines[i]:
+            seen_open = True
+        if seen_open and depth <= 0:
+            end = i
+            break
+    if end is None:
+        end = min(len(lines), start + PERF_MAX_BODY_LINES) - 1
+    return start, end
+
+
+def _analyze_query_signals(body):
+    """Metot gövdesinden ölçülen sorgu sinyalleri (KESİN kod gerçekleri).
+
+    Not: builder metotları hem instance (->with) hem statik/model (::with) formunda
+    çağrılabilir; her ikisi de yakalanır. Eloquent ->get() ile HTTP request->get('x')
+    ayrımı: gerçek Eloquent get()'in argümanı ya boştur ya da kolon dizisidir
+    (->get() / ->get([...])); request->get('param') dizeli argüman aldığı için hariç.
+    """
+    return {
+        "uses_all": bool(re.search(r"(?:->|::)all\(", body)),
+        "get_calls": len(re.findall(r"->get\(\s*(?:\)|\[)", body)),
+        "has_pagination": bool(re.search(r"(?:->|::)(?:paginate|simplePaginate|cursorPaginate)\(", body)),
+        "has_eager_load": bool(re.search(r"(?:->|::)(?:with|withCount|loadMissing)\(", body)),
+        "has_chunk_or_cursor": bool(re.search(r"(?:->|::)(?:chunk|cursor|lazy)\(", body)),
+        "loop_count": len(re.findall(r"\bforeach\b", body)),
+        "where_has": len(re.findall(r"whereHas\(", body)),
+    }
+
+
+def _method_snippet(lines, start, end):
+    """Metot imzası + sorgu sinyali satırları etrafında kırpılı numaralı bağlam."""
+    hits = [start] + [i for i in range(start, end + 1) if PERF_SNIP_RE.search(lines[i])]
+    wins = []
+    for i in sorted(set(hits)):
+        s = max(start, i - 1)
+        e = min(end, i + CONTEXT_AFTER)
+        if wins and s <= wins[-1][1] + 1:
+            wins[-1][1] = max(wins[-1][1], e)
+        else:
+            wins.append([s, e])
+    parts, total = [], 0
+    for s, e in wins:
+        chunk = "\n".join(f"{n + 1}: {lines[n]}" for n in range(s, e + 1))
+        if total + len(chunk) > PERF_MAX_SNIPPET_BYTES:
+            parts.append("    ... (kırpıldı)")
+            break
+        parts.append(chunk)
+        total += len(chunk)
+    return "\n    ...\n".join(parts)
+
+
+def collect_route_code_context(url, target_repo_path):
+    """URL -> controller metodu + sorgu sinyalleri + kod parçası (salt-okuma)."""
+    res = {"available": False, "url": url, "reason": None,
+           "route": None, "signals": {}, "snippet": None}
+    if not target_repo_path:
+        res["reason"] = "TARGET_REPO_PATH tanımlı değil."
+        return res
+    code_root = _resolve_code_root(target_repo_path)
+    if code_root is None:
+        res["reason"] = f"Kod kökü bulunamadı (app/ yok): {target_repo_path}"
+        return res
+
+    route = _find_route(code_root, url)
+    if route is None:
+        res["reason"] = "Route bulunamadı (closure route veya eşleşme yok)."
+        return res
+    res["route"] = route
+
+    resolved = _class_to_file(code_root, route["controller"])
+    if resolved is None:
+        res["reason"] = f"Controller dosyası bulunamadı: {route['controller']}"
+        return res
+    rel, f = resolved
+    if _is_sensitive(f.name):
+        res["reason"] = "Controller dosyası hassas olarak işaretli."
+        return res
+    try:
+        if f.stat().st_size > MAX_FILE_BYTES:
+            res["reason"] = "Controller dosyası boyut sınırını aşıyor."
+            return res
+        text = f.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        res["reason"] = "Controller dosyası okunamadı."
+        return res
+
+    lines = text.splitlines()
+    span = _extract_method_body(lines, route["method"])
+    if span is None:
+        res["reason"] = f"Metot bulunamadı: {route['method']}"
+        return res
+    start, end = span
+    body = "\n".join(lines[start:end + 1])
+
+    route["method_file"] = rel
+    route["method_line"] = start + 1
+    res["signals"] = _analyze_query_signals(body)
+    res["snippet"] = {"file": rel, "line": start + 1, "context": _method_snippet(lines, start, end)}
+    res["available"] = True
+    return res
 
 
 # --- Tek başına test (API çağrısı YOK; sadece kod okuma) ---------------------
