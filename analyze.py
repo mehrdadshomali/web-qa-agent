@@ -21,6 +21,8 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 import os
 
+from code_context import collect_code_context
+
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 8192
 # Fiyatlandırma (USD / 1M token) — maliyet tahmini için.
@@ -36,6 +38,44 @@ CONSOLE_NOISE = (
     "google-analytics", "googletagmanager", "doubleclick", "facebook",
     "gtag", "g/collect", "Failed to load resource",
 )
+
+# En fazla kaç farklı 500 için kod kanıtı toplanır (prompt şişmesin).
+CODE_EVIDENCE_MAX_500 = 5
+
+
+def collect_code_evidence(findings, target_repo_path):
+    """Her benzersiz 500 için code_context.py'den (salt-okuma) kanıt topla.
+
+    target_repo_path yok/erişilemezse boş liste döner (kod erişimi opsiyoneldir;
+    bu durumda analyze eski 'tahmin' davranışına düşer). Her 500'ün kod bağlamı
+    code_context tarafından ~birkaç KB ile sınırlanır.
+    """
+    if not target_repo_path:
+        return []
+    evidence, seen = [], set()
+    for p in findings.get("pages", []):
+        if not (p.get("status") and p["status"] >= 500 and p.get("exception")):
+            continue
+        url = p["url"]
+        if url in seen:
+            continue
+        seen.add(url)
+        exc = p["exception"]
+        message = exc.get("message") or exc.get("title") or ""
+        ctx = collect_code_context(message, target_repo_path)
+        if ctx.get("available") and ctx.get("snippets"):
+            evidence.append({
+                "url": url,
+                "status": p["status"],
+                "exception_class": exc.get("exception_class"),
+                "code_root": ctx.get("code_root"),
+                "search_terms": ctx.get("terms"),
+                "snippets": ctx["snippets"],
+                "truncated": ctx.get("truncated"),
+            })
+        if len(evidence) >= CODE_EVIDENCE_MAX_500:
+            break
+    return evidence
 
 
 def load_api_key():
@@ -189,9 +229,29 @@ KESİN TESPİT vs TAHMİN (çok önemli — ton kuralı):
   hangi JS kütüphanesinin yüklü olduğu vb.) "kontrol edilmeli" çerçevesinde öner;
   "şöyledir/şundandır" diye kesin ifade ETME.
 
+İSTİSNA — 'code_evidence' (kod-destekli teşhis):
+- Girdide bir 500 için 'code_evidence' verildiyse (o hataya ait GERÇEK kaynak koddan
+  okunmuş dosya/satır parçaları), o 500'ün teşhisini ARTIK TAHMİN DEĞİL kabul et:
+  KESİN dille yaz (yani "muhtemelen"/"doğrulanmalı" KULLANMA) ve teşhisini hangi
+  DOSYA:SATIR'a dayandırdığını AÇIKÇA belirt.
+- Bu kod-kanıtlı 500 teşhisinde şunları ver:
+  (a) hangi dosyadaki hangi sorgu/kod sorunu yaratıyor,
+  (b) NEDEN (ör. bir kolon Schema::hasColumn guard'ı OLMADAN kullanılıyor, oysa
+      aynı sorgudaki diğer kolonlar guard ile korunuyor; ya da model kolonu bekliyor
+      ama migration eklememiş),
+  (c) İKİ somut çözüm: (1) sorguyu guard'la (ör. eksik kolonu Schema::hasColumn ile
+      koru) VEYA (2) kolonu bir migration ile tabloya ekle.
+- 'code_evidence' VERİLMEYEN 500'lerde ve diğer tüm bulgularda yukarıdaki temkinli
+  ('muhtemelen', 'doğrulanmalı') dil aynen geçerlidir. Yani: kanıt varsa KESİN,
+  yoksa TEMKİNLİ.
+
 Girdideki 'accessibility_summary' kural bazında damıtılmıştır (rule id + impact +
 toplam öğe + kaç sayfada); ham node listesi yoktur. 'performance_summary' yalnızca
 en ağır 5 sayfayı ve genel ortalamaları içerir. Bunları olduğu gibi kullan.
+
+'code_evidence' (varsa) her kod-destekli 500 için şu yapıdadır:
+{url, status, exception_class, code_root, snippets:[{file, line, terms, context}]}
+— 'context' ilgili kaynak kodun numaralı satırlarıdır. Teşhisi bunlara dayandır.
 
 Rapor tarihini sana verilen gerçek 'scan_date' değerinden al (ISO tarih-saat; yalnızca
 tarih kısmını göstermen yeterli), ASLA uydurma. scan_date yoksa tarih satırı ekleme.
@@ -199,26 +259,40 @@ tarih kısmını göstermen yeterli), ASLA uydurma. scan_date yoksa tarih satır
 Raporun EN BAŞINA (ana başlık ve tarih/özet satırlarından hemen sonra) şu notu AYNEN ekle:
 > **Not:** Tespitler otomatik tarama ile ölçülmüştür ve kesindir. Kök neden analizleri
 > ve düzeltme önerileri, dış gözleme dayalı çıkarımlardır; uygulanmadan önce ilgili
-> geliştirici tarafından doğrulanmalıdır.
+> geliştirici tarafından doğrulanmalıdır. Kod kanıtına dayalı teşhisler ise ilgili
+> kaynak koddan doğrulanmıştır.
 
 Sadece verilen bulgulara dayan; veri uydurma. Türkçe yaz. Çıktı yalnızca Markdown olsun."""
 
 
 def call_anthropic(api_key, summary):
-    """API'yi çağır. (markdown_text, usage) döner. Hata fırlatabilir."""
+    """API'yi çağır. (markdown_text, usage) döner. Hata fırlatabilir.
+
+    Mutlak timeout (180s) + azaltılmış retry ile ağ stall'ında sonsuz asılı
+    kalmaz; süre aşımında APITimeoutError fırlar ve çağıran taraf yerel rapora
+    düşer (her halükârda çıktı üretilir). 180s, gözlenen ~110s'lik gerçek çağrı
+    süresine güvenli marj bırakır.
+    """
+    import time
+
     import anthropic
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key, timeout=180.0, max_retries=1)
     user_content = (
         "Aşağıdaki tarama bulgularını analiz et ve raporu üret.\n\n"
         "```json\n" + json.dumps(summary, indent=2, ensure_ascii=False) + "\n```"
     )
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_content}],
-    )
+    print("API çağrılıyor... (timeout=180s, max_retries=1)")
+    t0 = time.monotonic()
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_content}],
+        )
+    finally:
+        print(f"API çağrısı {time.monotonic() - t0:.1f} saniye sürdü.")
     text = "".join(b.text for b in response.content if b.type == "text")
     return text, response.usage
 
@@ -316,6 +390,18 @@ def main():
         REPORT_PATH.write_text(local_fallback_report(summary), encoding="utf-8")
         print(f"Yerel rapor yazıldı: {REPORT_PATH}")
         sys.exit(1)
+
+    # distill()'den SONRA, API çağrısından ÖNCE: her 500 için kaynak koddan kanıt
+    # topla (salt-okuma). TARGET_REPO_PATH yoksa atlanır -> eski 'tahmin' davranışı.
+    target_repo = os.environ.get("TARGET_REPO_PATH", "").strip()
+    summary["code_evidence"] = collect_code_evidence(findings, target_repo)
+    if summary["code_evidence"]:
+        print(f"[kod kanıtı] {len(summary['code_evidence'])} adet 500 için kaynak "
+              f"koddan kanıt toplandı (TARGET_REPO_PATH ayarlı).")
+    elif target_repo:
+        print("[kod kanıtı] TARGET_REPO_PATH ayarlı ama 500 için kanıt bulunamadı.")
+    else:
+        print("[kod kanıtı] TARGET_REPO_PATH ayarlı değil — kanıt atlandı (tahmin modu).")
 
     # API'yi çağır; başarısız olursa yerel rapora düş.
     try:
