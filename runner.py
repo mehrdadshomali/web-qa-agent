@@ -51,7 +51,16 @@ SKIP_PATTERNS = re.compile(
     # --- Türkçe: kaldırma — segment-sınırlı ('kaldirim' korunur) ---
     r"(?<![a-z])kald[ıi]r(?![a-z])|"
     # --- Türkçe: topluluk/kulüpten ayrılma — segment-sınırlı ('ayrilik' korunur) ---
-    r"(?<![a-z])ayr[ıi]l(?![a-z])"
+    r"(?<![a-z])ayr[ıi]l(?![a-z])|"
+    # --- Partner/brand YÖNETİM: create formları (events/opportunities/academy/
+    #     career-jobs/partner-challenges/blog create). Segment-anchor'lı '/create'
+    #     -> son segment '/create'i atlar ama 'create-cv' gibi masum slug'ları ELEMEZ.
+    #     Sitede TR create route'u yok; gelecek için olustur/oluştur da bounded eklendi. ---
+    r"/create(?:/|$)|(?<![a-z])olu[sş]tur(?![a-z])|"
+    # --- Partner profil mutasyonları: /professional/(company|brand-settings|club|
+    #     logo|cover). Bunlar PATCH endpoint'i (<a href> değil) — savunma amaçlı.
+    #     /professional/'a anchor'lı olduğundan public slug'larla ÇAKIŞMAZ. ---
+    r"/professional/(?:company|brand-settings|club|logo|cover)(?:/|$)"
     r")",
     re.IGNORECASE,
 )
@@ -115,13 +124,19 @@ def same_host(url, base_host):
     return urlparse(url).netloc == base_host
 
 
+# Atlanan URL'ler denetim için kaydedilir: strip_query'li path -> sebep.
+SKIPPED_URLS = {}
+
+
 def should_skip(url):
     """State değiştiren / auth / admin URL'lerini ATLA."""
     parsed = urlparse(url)
     path = parsed.path
     if re.search(r"/admin(/|$)", path, re.IGNORECASE):
+        SKIPPED_URLS.setdefault(path, "admin")
         return True
     if SKIP_PATTERNS.search(path) or (parsed.query and SKIP_PATTERNS.search(parsed.query)):
+        SKIPPED_URLS.setdefault(path, "skip_pattern")
         return True
     return False
 
@@ -417,14 +432,16 @@ def visit_page(browser, request_ctx, url, base_host, screenshots_dir, status_cac
 
 # --- Login (salt-okunur istisna) -------------------------------------------
 
-def do_login(browser, base_url, email, password):
-    """SALT-OKUNUR İSTİSNA: yalnızca /login formunu doldurup gönderir.
+def do_login(browser, base_url, email, password, login_path="/login"):
+    """SALT-OKUNUR İSTİSNA: yalnızca giriş formunu doldurup gönderir.
 
     Başka hiçbir form doldurulmaz/gönderilmez. CSRF token elle scrape edilmez —
     form @csrf içerir ve Playwright submit edince tarayıcı token/cookie'yi taşır.
+    login_path role'e göre değişir: youth -> /login, brand -> /kurumsal/giris
+    (kurumsal form gizli login_context=corporate alanını taşır; guard bunu ister).
     (basari, storage_state, final_url) döner.
     """
-    login_url = base_url + "/login"
+    login_url = base_url + login_path
     context = browser.new_context(ignore_https_errors=True)
     page = context.new_page()
     page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
@@ -465,7 +482,12 @@ def main():
                         help="Gezilecek maksimum sayfa (varsayılan: 50)")
     parser.add_argument("--login", action="store_true",
                         help="Crawl'dan önce QA test hesabıyla login ol (auth arkası "
-                             "youth sayfaları da taranır). .env: QA_LOGIN_EMAIL/PASSWORD")
+                             "sayfalar da taranır). Kimlik: --role ile seçilir.")
+    parser.add_argument("--role", choices=["youth", "brand"], default="youth",
+                        help="Login rolü: hangi QA test hesabıyla giriş yapılacak "
+                             "(varsayılan: youth). .env: QA_<ROL>_EMAIL / QA_<ROL>_PASSWORD "
+                             "(youth için geriye dönük QA_LOGIN_* de kabul edilir). "
+                             "Yalnızca --login ile birlikte etkilidir.")
     args = parser.parse_args()
 
     base_url = args.url.rstrip("/")
@@ -498,16 +520,33 @@ def main():
         login_status = "kapalı"
         if args.login:
             load_dotenv(Path(__file__).parent / ".env")
-            email = os.environ.get("QA_LOGIN_EMAIL", "test-youth@qa.local").strip()
-            password = os.environ.get("QA_LOGIN_PASSWORD", "")
+            role = args.role
+            prefix = f"QA_{role.upper()}"
+            default_email = {
+                "youth": "test-youth@qa.local",
+                "brand": "test-brand@qa.local",
+            }.get(role, "")
+            email = os.environ.get(f"{prefix}_EMAIL", "").strip()
+            password = os.environ.get(f"{prefix}_PASSWORD", "")
+            # Geriye dönük uyumluluk: youth için eski QA_LOGIN_* fallback.
+            if role == "youth":
+                email = email or os.environ.get("QA_LOGIN_EMAIL", "").strip()
+                password = password or os.environ.get("QA_LOGIN_PASSWORD", "")
+            email = email or default_email
             if not password:
-                print("\n[HATA] --login verildi ama QA_LOGIN_PASSWORD .env'de yok.")
-                print("       web-qa-agent/.env dosyasına QA_LOGIN_PASSWORD=... ekleyin.\n")
+                print(f"\n[HATA] --login (--role {role}) verildi ama {prefix}_PASSWORD .env'de yok.")
+                print(f"       web-qa-agent/.env dosyasına {prefix}_PASSWORD=... ekleyin.")
+                if role == "youth":
+                    print("       (Alternatif: eski QA_LOGIN_PASSWORD da kabul edilir.)")
+                print()
                 browser.close()
                 request_ctx.dispose()
                 sys.exit(1)
-            print(f"[login] Giriş deneniyor: {email} ...")
-            ok, auth_state, final_url = do_login(browser, base_url, email, password)
+            # brand hesapları normal /login portalından reddedilir
+            # (auth.brand_wrong_portal); kurumsal giriş formundan girmeli.
+            login_path = "/kurumsal/giris" if role == "brand" else "/login"
+            print(f"[login] Giriş deneniyor (rol={role}, yol={login_path}): {email} ...")
+            ok, auth_state, final_url = do_login(browser, base_url, email, password, login_path)
             if not ok:
                 login_status = "başarısız"
                 print("\n[HATA] Login başarısız — email/şifre .env'de doğru mu, hesap active mi?")
@@ -597,6 +636,7 @@ def main():
         "login": login_status,
         "pages_visited": len(findings),
         "max_pages_limit_reached": limit_reached,
+        "skipped_urls": [{"path": p, "reason": r} for p, r in sorted(SKIPPED_URLS.items())],
         "broken_targets": broken_targets_list,
         "downloadable_files": downloadable_files,
         "pages": findings,
@@ -649,6 +689,9 @@ def main():
     print(f"  Başarısız istek (dış/3P) : {third_party}")
     print(f"  Vite/HMR varlık uyarısı  : {vite_hmr}")
     print(f"  Auth nedeniyle atlanan   : {auth_skipped}")
+    print(f"  Skip-pattern ile atlanan : {len(SKIPPED_URLS)}")
+    for _p, _r in sorted(SKIPPED_URLS.items()):
+        print(f"       - {_p}  ({_r})")
     print(f"  Bulunan form sayısı      : {total_forms}")
     print(f"  Erişilebilirlik ihlali   : {a11y_total}  "
           f"(critical={a11y_impacts['critical']}, serious={a11y_impacts['serious']}, "
