@@ -25,6 +25,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import date
 from pathlib import Path
 from urllib.parse import urlparse
@@ -300,6 +301,97 @@ def teardown_paid_orders(target_repo, youth_email):
                    "Çıktı: " + out.strip()[:300])
 
 
+# --- Kayıt-mail akışı: tinker/log yardımcıları -----------------------------
+
+# Throwaway test kullanıcısı e-posta deseni — teardown guard'ları buna dayanır.
+REGISTER_EMAIL_PREFIX = "qa-mailtest-"
+REGISTER_EMAIL_DOMAIN = "@qa.local"
+
+
+def _run_tinker(target_repo, php, timeout=90):
+    """docker compose exec app php artisan tinker --execute. (çıktı, hata) döner;
+    çıktı None ise docker/exec hatası (hata mesajı ikinci değerde)."""
+    try:
+        proc = subprocess.run(
+            ["docker", "compose", "exec", "-T", "app",
+             "php", "artisan", "tinker", "--execute", php],
+            cwd=target_repo, capture_output=True, text=True, timeout=timeout,
+        )
+    except FileNotFoundError:
+        return None, "docker bulunamadı (PATH'te 'docker' yok)."
+    except subprocess.TimeoutExpired:
+        return None, "Tinker zaman aşımı (docker/container yanıt vermedi)."
+    return (proc.stdout or "") + (proc.stderr or ""), None
+
+
+def sweep_stale_register_users(target_repo):
+    """Yarıda kalan koşulardan artık qa-mailtest-%@qa.local kullanıcılarını süpür.
+    SADECE bu prefix+domain desenine dokunur. (ok, mesaj) döner."""
+    php = (
+        "$q=\\App\\Models\\User::where('email','like','"
+        + REGISTER_EMAIL_PREFIX + "%" + REGISTER_EMAIL_DOMAIN + "');"
+        "$n=$q->count();$q->delete();echo 'SWEPT n='.$n;"
+    )
+    out, err = _run_tinker(target_repo, php)
+    if out is None:
+        return False, err
+    m = re.search(r"SWEPT n=(\d+)", out)
+    if m:
+        return True, f"{m.group(1)} artık test kullanıcısı süpürüldü."
+    return False, "Süpürme başarısız. Çıktı: " + out.strip()[:200]
+
+
+def teardown_register_user(target_repo, email):
+    """Oluşan test kullanıcısını sil — ÜÇ KAT GUARD:
+      (Python) prefix + domain kontrolü, uymuyorsa hiç çağırma;
+      (PHP)    str_starts_with(prefix) + str_ends_with(domain), uymuyorsa SİLME;
+      (SQL)    TAM e-posta eşleşmesi (where email = ...).
+    Bu, gerçek/başka kullanıcıya dokunmayı imkânsız kılar. (ok, mesaj) döner."""
+    # 1. kat: Python guard — desen uymuyorsa docker'a hiç gitme.
+    if not (email.startswith(REGISTER_EMAIL_PREFIX) and email.endswith(REGISTER_EMAIL_DOMAIN)):
+        return False, f"GUARD: e-posta throwaway desenine uymuyor, SİLME iptal: {email}"
+    if "'" in email or "\\" in email:
+        return False, f"GUARD: e-postada geçersiz karakter, SİLME iptal: {email}"
+    # 2. + 3. kat: PHP guard + TAM eşleşme (LIKE değil, = ).
+    php = (
+        "$e='" + email + "';"
+        "if(!str_starts_with($e,'" + REGISTER_EMAIL_PREFIX + "')){echo 'GUARD_PREFIX_FAIL';}"
+        "elseif(!str_ends_with($e,'" + REGISTER_EMAIL_DOMAIN + "')){echo 'GUARD_DOMAIN_FAIL';}"
+        "else{$q=\\App\\Models\\User::where('email',$e);"
+        "$n=$q->count();$q->delete();echo 'DELETED n='.$n;}"
+    )
+    out, err = _run_tinker(target_repo, php)
+    if out is None:
+        return False, err
+    if "DELETED" in out:
+        m = re.search(r"DELETED n=(\d+)", out)
+        return True, f"{m.group(1) if m else '?'} test kullanıcısı silindi ({email})."
+    if "GUARD_PREFIX_FAIL" in out or "GUARD_DOMAIN_FAIL" in out:
+        return False, "PHP guard reddetti — silme yapılmadı (desen uymuyor)."
+    return False, "Kullanıcı silme başarısız. Çıktı: " + out.strip()[:200]
+
+
+def check_verification_mail_in_log(target_repo, email, retries=4):
+    """laravel.log'da benzersiz e-postanın (To:) geçip geçmediğini kontrol et — mail
+    log'a yazıldı mı, yani doğrulama maili tetiklendi mi (dışarı çıkmadan). Senkron
+    olsa da küçük gecikmeye karşı birkaç kez dener. (bulundu, mesaj) döner."""
+    # E-posta bizim ürettiğimiz güvenli desen; yine de shell metakarakteri olmasın.
+    if not re.fullmatch(r"[a-z0-9\-.@]+", email):
+        return False, f"log kontrolü: e-posta güvenli desende değil: {email}"
+    cmd = ["docker", "compose", "exec", "-T", "app", "sh", "-lc",
+           f"grep -c '{email}' storage/logs/laravel.log 2>/dev/null || true"]
+    for _ in range(retries):
+        try:
+            proc = subprocess.run(cmd, cwd=target_repo, capture_output=True, text=True, timeout=30)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            return False, f"log kontrolü çalıştırılamadı: {e}"
+        count = (proc.stdout or "0").strip().splitlines()[-1] if proc.stdout else "0"
+        if count.isdigit() and int(count) >= 1:
+            return True, f"laravel.log'da {count} kez geçiyor (To: {email}) — mail log'a yazıldı, dışarı çıkmadı."
+        time.sleep(1)
+    return False, f"laravel.log'da bulunamadı: {email} (doğrulama maili yazılmamış olabilir)."
+
+
 # --- Teardown: sepeti temizle (tekrarlanabilirlik) -------------------------
 
 def clear_cart(page, base_url):
@@ -547,6 +639,76 @@ def run_payment_flow(page, base_url, results):
                f"başarı doğrulanamadı (URL: {page.url}, başarı mesajı={success_flash})." + red_box_text(page))
 
 
+# --- Kayıt -> doğrulama maili akışı (guest) --------------------------------
+
+def run_register_mail_flow(page, base_url, unique_email, target_repo, results):
+    """Yeni kullanıcı kaydı -> Laravel doğrulama maili -> laravel.log'da görünür mü.
+    Guest akışı (login gerektirmez). Kayıt formu 2 adımlı Alpine wizard.
+    """
+    password = "QaMailTest12345"
+
+    # ADIM 1 — kayıt sayfası, adım-1 alanları + "Devam Et"
+    step(1, "Kayıt sayfası: adım-1 bilgilerini doldur ve 'Devam Et'")
+    page.goto(base_url + "/register", wait_until="load")
+    page.wait_for_timeout(ALPINE_WAIT_MS)
+    page.fill("input[name='first_name']", "QA")
+    page.fill("input[name='last_name']", "Mailtest")
+    page.fill("input[name='email']", unique_email)
+    page.fill("input[name='password']", password)
+    page.fill("input[name='password_confirmation']", password)
+    page.get_by_role("button", name="Devam Et").click()
+    page.wait_for_timeout(ALPINE_WAIT_MS)
+    # Adım 2 göründü mü? (birth_year/city select'leri görünür olmalı)
+    city_sel = page.locator("select[name='city']")
+    try:
+        step2_ok = city_sel.first.is_visible()
+    except PlaywrightError:
+        step2_ok = False
+    if step2_ok:
+        passed(results, "kayit-adim1", f"adım-2'ye geçildi (e-posta: {unique_email})")
+    else:
+        failed(results, "kayit-adim1", "adım-2'ye geçilemedi (Devam Et pasif / validation)." + red_box_text(page))
+        return
+
+    # ADIM 2 — birth_year (dinamik en yaşlı = garantili 40+) + city (ilk geçerli) + "Kayıt Ol"
+    step(2, "Adım-2: birth_year (40+ dinamik) + city seç, 'Kayıt Ol'")
+    years = page.eval_on_selector_all(
+        "select[name='birth_year'] option",
+        "els => els.map(e => e.value).filter(v => /^\\d{4}$/.test(v))",
+    )
+    cities = page.eval_on_selector_all(
+        "select[name='city'] option",
+        "els => els.map(e => e.value).filter(v => v && v.trim() !== '')",
+    )
+    if not years or not cities:
+        failed(results, "kayit-adim2", f"birth_year/city option'ları okunamadı (years={len(years or [])}, cities={len(cities or [])}).")
+        return
+    oldest = str(min(int(y) for y in years))  # en küçük yıl = en yaşlı => isStandardAccount
+    page.select_option("select[name='birth_year']", oldest)
+    page.select_option("select[name='city']", cities[0])
+    page.wait_for_timeout(ALPINE_WAIT_MS)
+    print(f"   · birth_year={oldest} (40+ garantili), city='{cities[0]}'")
+    try:
+        with page.expect_navigation(wait_until="load", timeout=NAV_TIMEOUT_MS):
+            page.get_by_role("button", name="Kayıt Ol").click()
+    except PlaywrightTimeoutError:
+        pass
+    page.wait_for_timeout(ALPINE_WAIT_MS)
+    if urlparse(page.url).path.rstrip("/") == "/dashboard":
+        passed(results, "kayit-adim2", f"kayıt başarılı, /dashboard'a inildi: {page.url}")
+    else:
+        failed(results, "kayit-adim2", f"/dashboard'a gidilemedi (URL: {page.url})." + red_box_text(page))
+        return
+
+    # ADIM 3 — doğrulama maili log'da mı? (mail dışarı çıkmaz, log'a yazılır)
+    step(3, "Doğrulama maili laravel.log'da mı (dışarı çıkmadan)")
+    found, msg = check_verification_mail_in_log(target_repo, unique_email)
+    if found:
+        passed(results, "dogrulama-maili", msg)
+    else:
+        failed(results, "dogrulama-maili", msg)
+
+
 # --- Orkestrasyon ----------------------------------------------------------
 
 def main():
@@ -568,6 +730,10 @@ def main():
     parser.add_argument("--pay", action="store_true",
                         help="Sepet akışının ardından ÖDEME akışını da çalıştır (fake gateway). "
                              "Başında ödenmiş test siparişlerini scoped teardown ile temizler.")
+    parser.add_argument("--register-mail", action="store_true",
+                        help="Kayıt -> doğrulama maili akışını çalıştır (guest; login/profil "
+                             "gerektirmez). Yeni throwaway kullanıcı oluşturur, mail log'da mı "
+                             "kontrol eder, sonunda o kullanıcıyı scoped teardown ile siler.")
     args = parser.parse_args()
 
     base_url = args.url.rstrip("/")
@@ -590,7 +756,8 @@ def main():
              or os.environ.get("QA_LOGIN_EMAIL", "").strip()
              or "test-youth@qa.local")
     password = os.environ.get("QA_YOUTH_PASSWORD", "") or os.environ.get("QA_LOGIN_PASSWORD", "")
-    if not password:
+    # Kayıt-mail akışı GUEST'tir (youth login gerektirmez) -> şifre şart değil.
+    if not args.register_mail and not password:
         print("\n[HATA] youth şifresi yok: web-qa-agent/.env'e QA_YOUTH_PASSWORD "
               "(veya QA_LOGIN_PASSWORD) ekleyin.\n")
         sys.exit(1)
@@ -612,6 +779,83 @@ def main():
 
         browser = p.chromium.launch(headless=not args.headed,
                                     slow_mo=args.slow_mo if args.headed else 0)
+
+        # === KAYIT -> DOĞRULAMA MAİLİ AKIŞI (guest; login/profil gerektirmez) ===
+        if args.register_mail:
+            hdr("KAYIT -> DOĞRULAMA MAİLİ AKIŞI (guest)")
+            target_repo = resolve_target_repo()
+            if not target_repo or not Path(target_repo).is_dir():
+                print(f"  ! TARGET_REPO_PATH geçersiz ({target_repo}) — teardown/log yapılamaz.")
+                browser.close()
+                sys.exit(4)
+
+            # Opsiyonel başlangıç süpürmesi (yarıda kalan koşulardan artıklar).
+            print("[SÜPÜRME] Artık qa-mailtest-%@qa.local kullanıcıları temizleniyor...")
+            sok, smsg = sweep_stale_register_users(target_repo)
+            print(f"   · {smsg}")
+            if not sok:
+                print("\n[DURDURULDU] Başlangıç süpürmesi başarısız — körlemesine devam edilmiyor.\n")
+                browser.close()
+                sys.exit(4)
+
+            unique_email = f"{REGISTER_EMAIL_PREFIX}{int(time.time())}{REGISTER_EMAIL_DOMAIN}"
+            context = browser.new_context(ignore_https_errors=True)
+            page = context.new_page()
+            page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+            js_errors = []
+            page.on("console", lambda m: js_errors.append(m.text) if m.type == "error" else None)
+            page.on("pageerror", lambda e: js_errors.append(f"pageerror: {e}"))
+            page.on("response", lambda r: net_bad.append((r.url, r.status))
+                    if (r.status >= 500 and urlparse(r.url).netloc == base_host) else None)
+
+            try:
+                run_register_mail_flow(page, base_url, unique_email, target_repo, results)
+            except PlaywrightError as e:
+                failed(results, "akış", f"Beklenmeyen Playwright hatası: {e}")
+
+            # Genel hata taraması
+            step(4, "Genel hata taraması (console / pageerror / HTTP 5xx)")
+            clean = True
+            if js_errors:
+                clean = False
+                print(f"   ✗ {len(js_errors)} JS hatası:")
+                for e in js_errors[:10]:
+                    print(f"      - {e}")
+            if net_bad:
+                clean = False
+                print(f"   ✗ {len(net_bad)} 5xx yanıtı:")
+                for u, s in net_bad[:10]:
+                    print(f"      - [{s}] {u}")
+            if clean:
+                passed(results, "hata-taramasi", "console/pageerror yok, 5xx yok")
+            else:
+                failed(results, "hata-taramasi", "console/HTTP hatası tespit edildi (yukarıda)")
+
+            # TEARDOWN — oluşan test kullanıcısını sil (üç kat guard). Akış başarısız
+            # olsa da kullanıcı oluşmuş olabilir; her hâlde silmeyi dene.
+            hdr("TEARDOWN — test kullanıcısı sil")
+            tok, tmsg = teardown_register_user(target_repo, unique_email)
+            print(f"  · {tmsg}")
+            if not tok:
+                print("  ! Teardown başarısız — bu kullanıcı elle silinmeli (yukarıdaki mesaj).")
+
+            context.close()
+            browser.close()
+
+            # Özet
+            hdr("ÖZET")
+            all_ok = all(ok for _, ok, _ in results) and len(results) > 0
+            for name, ok, detail in results:
+                print(f"  {'✓' if ok else '✗'} {name:<18} {detail}")
+            print("-" * 62)
+            if all_ok:
+                print("  SONUÇ: ✓ KAYIT+MAİL AKIŞI BAŞARILI — kayıt oldu, doğrulama maili "
+                      "log'a yazıldı (dışarı çıkmadı).")
+            else:
+                first_fail = next((n for n, ok, _ in results if not ok), "?")
+                print(f"  SONUÇ: ✗ BAŞARISIZ — ilk kalınan adım: '{first_fail}'.")
+            print("=" * 62 + "\n")
+            sys.exit(0 if all_ok else 1)
 
         # === LOGIN (runner.do_login yeniden kullanılır) ===
         hdr("LOGIN")
