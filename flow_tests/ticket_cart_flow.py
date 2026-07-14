@@ -22,6 +22,8 @@ Not: Bu betik kodu yazıp durur; çalıştırma kullanıcı onayıyla yapılır.
 
 import argparse
 import os
+import re
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
@@ -87,6 +89,17 @@ def resolve_target_env(explicit):
         trp = read_env_file(agent_env).get("TARGET_REPO_PATH", "").strip()
         if trp:
             return str(Path(trp) / "src" / ".env")
+    return None
+
+
+def resolve_target_repo():
+    """Hedef Laravel repo kökü (docker-compose.yml burada) — teardown'ın çalışma
+    dizini. web-qa-agent/.env içindeki TARGET_REPO_PATH."""
+    agent_env = ROOT / ".env"
+    if agent_env.is_file():
+        trp = read_env_file(agent_env).get("TARGET_REPO_PATH", "").strip()
+        if trp:
+            return trp
     return None
 
 
@@ -240,6 +253,53 @@ def find_suitable_event(page, base_url):
     return None
 
 
+# --- Teardown: ödenmiş test siparişleri (scoped tinker) --------------------
+
+def teardown_paid_orders(target_repo, youth_email):
+    """docker compose exec app php artisan tinker ile, YALNIZCA youth test kullanıcısının
+    + QA test etkinliğinin (slug=qa-test-etkinlik) order'larını siler. Biletler FK
+    cascade ile otomatik gider. Silme ÇİFT KOŞULLU koda gömülüdür (user_id + event_id)
+    ve slug önce doğrulanır; başka kullanıcı/etkinliğe ASLA dokunmaz.
+    (ok: bool, mesaj: str) döner. Docker/container hatasında ok=False -> akış durmalı.
+    """
+    # E-postada tek tırnak olursa PHP string literal'i bozulur -> güvenli-red.
+    if "'" in youth_email or "\\" in youth_email:
+        return False, f"Güvenlik: e-postada geçersiz karakter, teardown iptal: {youth_email}"
+
+    php = (
+        "$e=\\App\\Models\\Event::where('slug','qa-test-etkinlik')->first();"
+        "$u=\\App\\Models\\User::where('email','" + youth_email + "')->first();"
+        "if(!$e){echo 'TEARDOWN_NO_EVENT';}"
+        "elseif($e->slug!=='qa-test-etkinlik'){echo 'TEARDOWN_SLUG_MISMATCH';}"
+        "elseif(!$u){echo 'TEARDOWN_NO_USER';}"
+        "else{$q=\\App\\Models\\Order::where('user_id',$u->id)->where('event_id',$e->id);"
+        "$n=$q->count();$q->delete();echo 'TEARDOWN_OK deleted='.$n;}"
+    )
+    try:
+        proc = subprocess.run(
+            ["docker", "compose", "exec", "-T", "app",
+             "php", "artisan", "tinker", "--execute", php],
+            cwd=target_repo, capture_output=True, text=True, timeout=90,
+        )
+    except FileNotFoundError:
+        return False, "docker bulunamadı (PATH'te 'docker' yok)."
+    except subprocess.TimeoutExpired:
+        return False, "Teardown zaman aşımı (docker/container yanıt vermedi)."
+
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if "TEARDOWN_OK" in out:
+        m = re.search(r"TEARDOWN_OK deleted=(\d+)", out)
+        return True, f"{m.group(1) if m else '?'} paid order silindi (biletler cascade)."
+    if "TEARDOWN_NO_EVENT" in out:
+        return False, "qa-test-etkinlik bulunamadı — önce QaTicketedEventSeeder çalıştırın."
+    if "TEARDOWN_NO_USER" in out:
+        return False, f"Youth test kullanıcısı yok: {youth_email}"
+    if "TEARDOWN_SLUG_MISMATCH" in out:
+        return False, "Güvenlik: slug eşleşmedi — teardown iptal (silme yapılmadı)."
+    return False, ("Teardown başarısız (docker ayakta mı, container adı 'app' mı?). "
+                   "Çıktı: " + out.strip()[:300])
+
+
 # --- Teardown: sepeti temizle (tekrarlanabilirlik) -------------------------
 
 def clear_cart(page, base_url):
@@ -364,6 +424,129 @@ def run_flow(page, base_url, results, net_bad):
                 "1 ise bu limit olabilir — uygulama hatası olmayabilir; PATCH yanıtını kontrol edin.")
 
 
+# --- Ödeme akışı (fake gateway) --------------------------------------------
+
+def red_box_text(page):
+    """Sayfada görünür kırmızı hata kutusu (bg-red-50 / text-red-600) varsa metnini
+    döner. Tam-sayfa form POST akışında validation hatası böyle gösterilir."""
+    boxes = page.locator("div.bg-red-50, .text-red-600")
+    try:
+        if boxes.count() > 0 and boxes.first.is_visible():
+            return " | Kırmızı hata kutusu: " + boxes.first.inner_text().strip()[:200]
+    except PlaywrightError:
+        pass
+    return ""
+
+
+def run_payment_flow(page, base_url, results):
+    """Sepet akışının DEVAMI: /sepet -> billing -> onayla -> ödemeye geç -> fake ödeme
+    -> başarı. Tek-sipariş dalını (checkout.show) hedefler. Hata tespiti tam-sayfa form
+    POST'a göre: kırmızı kutu + beklenmedik sayfada kalma (5xx global taramada yakalanır).
+    """
+    # ADIM A — sepette fatura bilgileri + "Sepeti onayla"
+    step("A", "Fatura bilgilerini doldur ve 'Sepeti onayla' (/sepet)")
+    page.goto(base_url + "/sepet", wait_until="load")
+    page.wait_for_timeout(ALPINE_WAIT_MS)
+
+    # Ödenebilirlik: her katılımcı ad-soyad ister; yalnızca 1. katılımcı profilden
+    # otomatik dolar. Sepet akışı adedi 2 yaptığından, ödeme için TEK katılımcıya indir
+    # (2. katılımcı bilgisi olmadan "Sepeti onayla" pasif kalır). Buton pasifliği
+    # sunucu-tarafı render olduğundan, adedi düşürünce /sepet'i yeniden yükle.
+    item = page.locator("[x-data^='cartItemCard']").first
+    if item.count() > 0:
+        qspan = item.locator("[x-text='getQty()']").first
+        dash = item.locator("button:has(i.bi-dash)").first
+        reduced = 0
+        while reduced < 10 and read_int(qspan, 1) > 1 and dash.count() > 0:
+            dash.click()
+            page.wait_for_timeout(AJAX_WAIT_MS)  # PATCH /yapilandir
+            reduced += 1
+        if reduced > 0:
+            print(f"   · ödenebilirlik: katılımcı adedi 1'e indirildi ({reduced} adım), /sepet yeniden yükleniyor")
+            page.goto(base_url + "/sepet", wait_until="load")
+            page.wait_for_timeout(ALPINE_WAIT_MS)
+
+    form = page.locator("form[action*='/sepet/odeme']")
+    if form.count() == 0:
+        failed(results, "odeme-onayla", "/sepet'te checkout formu (cart.checkout) yok — sepet boş olabilir.")
+        return
+    form.locator("input[name='billing_title']").fill("QA Test Fatura")
+    form.locator("textarea[name='billing_address']").fill("QA Test Mah. Test Sok. No:1")
+    form.locator("input[name='billing_city']").fill("İstanbul")
+    form.locator("input[name='billing_district']").fill("Kadıköy")
+    onayla = form.get_by_role("button", name="Sepeti onayla")
+    if not onayla.is_enabled():
+        failed(results, "odeme-onayla", "'Sepeti onayla' pasif (eksik katılımcı bilgisi olabilir).")
+        return
+    try:
+        with page.expect_navigation(wait_until="load", timeout=NAV_TIMEOUT_MS):
+            onayla.click()
+    except PlaywrightTimeoutError:
+        pass
+    page.wait_for_timeout(ALPINE_WAIT_MS)
+    if urlparse(page.url).path.rstrip("/") == "/sepet/kontrol":
+        passed(results, "odeme-onayla", "fatura kaydedildi, /sepet/kontrol'e geçildi")
+    else:
+        failed(results, "odeme-onayla", f"/sepet/kontrol'e geçilemedi (URL: {page.url})." + red_box_text(page))
+        return
+
+    # ADIM B — özet: onay kutusu + "Ödemeye Geç"
+    step("B", "Sipariş özetinde onay kutusu + 'Ödemeye Geç' (/sepet/kontrol)")
+    page.locator("input[name='confirm']").check()
+    try:
+        with page.expect_navigation(wait_until="load", timeout=NAV_TIMEOUT_MS):
+            page.get_by_role("button", name="Ödemeye Geç").click()
+    except PlaywrightTimeoutError:
+        pass
+    page.wait_for_timeout(ALPINE_WAIT_MS)
+    if re.match(r"^/checkout/\d+", urlparse(page.url).path):
+        passed(results, "odemeye-gec", f"sipariş oluştu: {page.url}")
+    else:
+        detail = f"/checkout/{{order}}'a geçilemedi (URL: {page.url})."
+        if "/sepet/odeme/" in page.url:
+            detail += " (çoklu-sipariş dalı — bu akış tek-sipariş hedefliyor)"
+        failed(results, "odemeye-gec", detail + red_box_text(page))
+        return
+
+    # ADIM C — ödeme sayfası: "Ödemeyi Tamamla"
+    step("C", "Ödeme sayfasında 'Ödemeyi Tamamla' (/checkout/{order})")
+    pay = page.locator("button[formaction*='/pay']")
+    if pay.count() == 0:
+        failed(results, "odemeyi-tamamla", "'Ödemeyi Tamamla' butonu (formaction=checkout.pay) yok.")
+        return
+    try:
+        with page.expect_navigation(wait_until="load", timeout=NAV_TIMEOUT_MS):
+            pay.first.click()
+    except PlaywrightTimeoutError:
+        pass
+    page.wait_for_timeout(ALPINE_WAIT_MS)
+    if re.match(r"^/fake-pay/\d+", urlparse(page.url).path):
+        passed(results, "odemeyi-tamamla", f"fake ödeme sayfasına yönlendirildi: {page.url}")
+    else:
+        failed(results, "odemeyi-tamamla", f"/fake-pay/{{order}}'a geçilemedi (URL: {page.url})." + red_box_text(page))
+        return
+
+    # ADIM D — sahte ödeme: "Başarılı Ödeme (Simülasyon)" (.btn-success)
+    step("D", "Sahte ödeme sayfasında 'Başarılı Ödeme (Simülasyon)' (/fake-pay/{order})")
+    succ = page.locator("form[action*='/fake-pay/'][action$='/success'] button[type='submit']")
+    if succ.count() == 0:
+        failed(results, "fake-basarili", "'Başarılı Ödeme' butonu bulunamadı (success formu yok).")
+        return
+    try:
+        with page.expect_navigation(wait_until="load", timeout=NAV_TIMEOUT_MS):
+            succ.first.click()
+    except PlaywrightTimeoutError:
+        pass
+    page.wait_for_timeout(ALPINE_WAIT_MS)
+    on_dashboard = urlparse(page.url).path.rstrip("/") == "/dashboard"
+    success_flash = page.get_by_text("Ödemeniz başarılı", exact=False).count() > 0
+    if on_dashboard and success_flash:
+        passed(results, "fake-basarili", "ödeme başarılı — /dashboard + 'Ödemeniz başarılı' mesajı")
+    else:
+        failed(results, "fake-basarili",
+               f"başarı doğrulanamadı (URL: {page.url}, başarı mesajı={success_flash})." + red_box_text(page))
+
+
 # --- Orkestrasyon ----------------------------------------------------------
 
 def main():
@@ -382,6 +565,9 @@ def main():
     parser.add_argument("--gates-only", action="store_true",
                         help="Yalnızca kapıları (güvenlik + login + profil) çalıştır; "
                              "akışa GİRME. Profil ön koşulunu doğrulamak için.")
+    parser.add_argument("--pay", action="store_true",
+                        help="Sepet akışının ardından ÖDEME akışını da çalıştır (fake gateway). "
+                             "Başında ödenmiş test siparişlerini scoped teardown ile temizler.")
     args = parser.parse_args()
 
     base_url = args.url.rstrip("/")
@@ -476,12 +662,32 @@ def main():
             try:
                 if r.status >= 400 and (urlparse(r.url).netloc == base_host):
                     # Akışın kritik uçları veya aynı-host 5xx -> gerçek hata
-                    if any(k in r.url for k in ("/sepete-ekle", "/odeme/dogrula", "/yapilandir")) \
+                    if any(k in r.url for k in (
+                        "/sepete-ekle", "/odeme/dogrula", "/yapilandir",
+                        "/sepet/odeme", "/sepet/onayla", "/checkout/", "/fake-pay/")) \
                             or r.status >= 500:
                         net_bad.append((r.url, r.status))
             except PlaywrightError:
                 pass
         page.on("response", on_response)
+
+        # TEARDOWN (ödeme) — YALNIZCA --pay: youth + qa-test-etkinlik paid order'larını
+        # scoped tinker ile sil (biletler cascade). Başarısızsa körlemesine devam etme.
+        if args.pay:
+            print("\n[TEARDOWN-ÖDEME] Ödenmiş test siparişleri temizleniyor (scoped: youth + qa-test-etkinlik)...")
+            target_repo = resolve_target_repo()
+            if not target_repo or not Path(target_repo).is_dir():
+                print(f"   ! TARGET_REPO_PATH geçersiz ({target_repo}) — teardown yapılamıyor.")
+                context.close()
+                browser.close()
+                sys.exit(4)
+            tok, tmsg = teardown_paid_orders(target_repo, email)
+            print(f"   · {tmsg}")
+            if not tok:
+                print("\n[DURDURULDU] Ödeme teardown başarısız — körlemesine devam edilmiyor.\n")
+                context.close()
+                browser.close()
+                sys.exit(4)
 
         # TEARDOWN — tekrarlanabilirlik: akış temiz sepetle başlasın.
         print("\n[TEARDOWN] Youth'un sepeti temizleniyor (temiz başlangıç)...")
@@ -496,6 +702,10 @@ def main():
 
         try:
             run_flow(page, base_url, results, net_bad)
+            # Ödeme akışı SADECE sepet akışı sorunsuzsa ve --pay verildiyse.
+            if args.pay and all(ok for _, ok, _ in results):
+                hdr("ÖDEME AKIŞI: sepet -> fake gateway ile öde")
+                run_payment_flow(page, base_url, results)
         except PlaywrightError as e:
             failed(results, "akış", f"Beklenmeyen Playwright hatası: {e}")
 
