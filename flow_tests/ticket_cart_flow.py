@@ -15,7 +15,7 @@ mevcut yapıdan (#bilet-al, [x-data^=cartItemCard], .bi-plus) türetilir.
 Kullanım:
     python flow_tests/ticket_cart_flow.py                 # görünür (headed) çalışır
     python flow_tests/ticket_cart_flow.py --no-headed     # CI / arka plan
-    python flow_tests/ticket_cart_flow.py --target-env /Users/.../badinext2/src/.env
+    python flow_tests/ticket_cart_flow.py --target-env /path/to/target-app/src/.env
 
 Not: Bu betik kodu yazıp durur; çalıştırma kullanıcı onayıyla yapılır.
 """
@@ -112,7 +112,7 @@ def check_security_precondition(target_env_path):
             f"Hedef src/.env bulunamadı: {target_env_path}",
             "Güvenlik ön koşulu DOĞRULANAMADI — çalışma reddedildi.",
             "Çözüm: --target-env ile doğru yolu verin, ör:",
-            "  --target-env /Users/mehrdadshomali/Desktop/badinext2/src/.env",
+            "  --target-env /path/to/target-app/src/.env",
             "(web-qa-agent/.env içindeki TARGET_REPO_PATH yanlış olabilir.)",
         ]
     env = read_env_file(target_env_path)
@@ -177,7 +177,7 @@ def profile_remediation(reason):
     if reason == "email":
         lines += [
             "Sebep: youth test hesabının e-postası DOĞRULANMAMIŞ.",
-            "Çözüm (badinext2/src içinde tinker ile):",
+            "Çözüm (hedef uygulama src/ içinde tinker ile):",
             "  User::where('email','test-youth@qa.local')->update(['email_verified_at'=>now()]);",
         ]
     elif reason == "profile":
@@ -713,7 +713,7 @@ def run_register_mail_flow(page, base_url, unique_email, target_repo, results):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="badinext ilk E2E akışı — bilet ekle + sepette adet artır (güvenli-varsayılan)")
+        description="Hedef uygulama E2E akışı — bilet ekle + sepette adet artır (güvenli-varsayılan)")
     parser.add_argument("--url", default="http://localhost:8080", help="Base URL")
     parser.add_argument("--role", choices=["youth"], default="youth",
                         help="Login rolü (ilk akış: yalnızca youth)")

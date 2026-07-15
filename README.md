@@ -1,35 +1,55 @@
 # web-qa-agent
 
-Bağımsız, **salt-okunur bir QA gezgini + AI rapor üreticisi**. Herhangi bir web
-uygulamasına yalnızca ağ üzerinden (HTTP) bağlanır; guest ve (opsiyonel) giriş
-yapılmış yüzeyi gezer, teknik/erişilebilirlik/performans verisi toplar ve
-Anthropic Claude ile önceliklendirilmiş bir kalite raporu üretir. İsteğe bağlı
-olarak sonucu Telegram'a gönderir ve haftalık otomatik çalışır.
+**AI destekli QA + E2E test ajanı** — herhangi bir web uygulamasına tarayıcı
+üzerinden bağlanır. İki tamamlayıcı yeteneği vardır:
 
-**Salt-okunur tasarım:** yalnızca `GET` navigasyonu. Hiçbir form gönderilmez
-(yalnızca envantere alınır); durum değiştiren uçlar (logout, delete, checkout,
-sepet/ödeme, `/admin`, vb. — İngilizce ve Türkçe kalıplar) atlanır. Tek istisna,
-açıkça istendiğinde `/login` formunun doldurulup gönderilmesidir (auth arkasını
-gezmek için).
+1. **Salt-okunur QA gezgini + AI rapor üreticisi** — guest ve (opsiyonel) giriş
+   yapılmış yüzeyi gezer; teknik/erişilebilirlik/performans verisi toplar ve
+   Anthropic Claude ile önceliklendirilmiş bir kalite raporu üretir. İsteğe bağlı
+   olarak sonucu Telegram'a gönderir ve haftalık otomatik çalışır.
+2. **Uçtan uca (E2E) akış testleri** — Playwright ile kritik kullanıcı yolculuklarını
+   *gerçekten* sürer (tıklar, form doldurur, satın alır). Bu kısım **aktif** aksiyon
+   alır ama katı bir **güvenli-ortam kapısının** arkasındadır: yalnızca mailler log'a
+   yazılan ve ödemeler sahte (fake) sağlayıcıya giden **yerel/izole** bir ortamda
+   çalışır (aşağıya bakın).
 
-Server-side render eden uygulamalar için tasarlanmıştır (ör. Laravel/Blade +
-Alpine.js; ağır animasyon kütüphaneleri — Three.js/GSAP — göz önünde
-bulundurulmuştur). Hedef uygulamanın kaynak koduna veya veritabanına erişmez;
-her şeyi tarayıcı üzerinden dışarıdan gözlemler.
+**Salt-okunur gezgin (1. yetenek):** yalnızca `GET` navigasyonu. Hiçbir form
+gönderilmez (yalnızca envantere alınır); durum değiştiren uçlar (logout, delete,
+checkout, sepet/ödeme, `/admin`, vb. — İngilizce ve Türkçe kalıplar) atlanır. Tek
+istisna, açıkça istendiğinde `/login` formunun doldurulup gönderilmesidir (auth
+arkasını gezmek için).
+
+**E2E akışları (2. yetenek):** durum değiştiren gerçek aksiyonlar (bkz.
+[E2E akış testleri](#e2e-akış-testleri)). Her çalıştırma, hedefin `.env`'ini
+okuyup `MAIL_MAILER=log` ve ödeme sağlayıcısının `fake`/boş olduğunu doğrular;
+aksi hâlde çalışmayı reddeder — böylece yanlışlıkla gerçek mail/ödeme moduna
+geçmiş bir ortamda hiçbir aksiyon alınmaz.
+
+Server-side render eden uygulamalar için tasarlanmıştır (ör. Blade + Alpine.js
+gibi yapılar; ağır animasyon kütüphaneleri — Three.js/GSAP — göz önünde
+bulundurulmuştur). Salt-okunur gezgin hedefin kaynak koduna/veritabanına erişmez;
+E2E akışları ise yalnızca tekrarlanabilirlik için (teardown) hedefin *yerel* test
+veritabanına dokunur — sıkı, kapsamı sınırlı biçimde.
 
 ---
 
 ## Mimari / akış
 
 ```
+# Salt-okunur QA gezgini + AI rapor
 runner.py     →  reports/findings.json      (salt-okunur tarama: teknik + a11y + perf)
 analyze.py    →  reports/report.md          (findings'i damıtıp Claude'a gönderir)
 run_qa.py     →  yukarıdaki ikisini tek komutta zincirler
 telegram_bot.py →  botla /tara, /test komutları; raporu Telegram'a gönderir
 weekly_run.py + launchd  →  haftalık otomatik çalışma + Telegram teslimi
+
+# Aktif E2E akış testleri (güvenli-ortam kapısı arkasında)
+flow_tests/ticket_cart_flow.py  →  sepet / ödeme / kayıt+mail E2E akışları (headed)
 ```
 
-Her katman incedir ve bir alttakini çağırır; alt bileşenlere dokunmaz.
+Salt-okunur katmanlar incedir ve bir alttakini çağırır; alt bileşenlere dokunmaz.
+E2E modülü ayrıdır: gezginin `do_login` ve dinleyici mantığını **yeniden kullanır**
+ama onu değiştirmez.
 
 ---
 
@@ -160,6 +180,77 @@ launchctl unload -w ~/Library/LaunchAgents/com.example.qa-weekly.plist
 
 Çalışma geçmişi `logs/weekly.log`'a; launchd çıktısı `logs/launchd.*.log`'a yazılır.
 
+---
+
+## E2E akış testleri
+
+`flow_tests/ticket_cart_flow.py`, kritik kullanıcı yolculuklarını Playwright ile
+**gerçekten sürer** (headed/görünür varsayılan). Salt-okunur gezginden farklı olarak
+bu akışlar **durum değiştirir** (tıklama, form, satın alma); bu yüzden her çalıştırma
+katı bir güvenli-ortam kapısıyla başlar.
+
+### Güvenlik kapısı (her çalıştırmadan önce)
+
+Akış, hedef uygulamanın `src/.env`'ini okur ve **yalnızca** şu koşullarda devam eder:
+
+- `MAIL_MAILER=log` → mailler dışarı çıkmaz, yalnızca hedefin loguna yazılır.
+- Ödeme sağlayıcısı `fake` veya boş → gerçek ödeme sağlayıcısına (gerçek para) gidilmez.
+
+Koşullar sağlanmazsa ya da `src/.env` bulunamazsa, çalışma **reddedilir** (hiçbir
+aksiyon alınmaz). Hedefin yolu `web-qa-agent/.env` içindeki `TARGET_REPO_PATH`'ten
+çözülür veya `--target-env` ile verilir.
+
+### Ön koşullar
+
+- Çalışır durumda **yerel/izole** bir hedef uygulama (`docker compose` ile ayakta).
+- Hedefte seed'lenmiş **atılabilir test verisi**: bir test kullanıcısı (profil tam +
+  e-posta doğrulanmış) ve satışta ürünü olan bir test kaydı. (Bu araç hedefin
+  koduna dosya eklemez; test verisini hedefin kendi seed mekanizmasıyla hazırlarsınız.)
+
+### Üç akış
+
+```bash
+# 1) Sepet akışı (varsayılan): ürün ekle → sepette adedi artır → doğrula
+python flow_tests/ticket_cart_flow.py
+
+# 2) Ödeme akışı: sepet akışının devamı → fatura → onay → fake gateway ile öde → doğrula
+python flow_tests/ticket_cart_flow.py --pay
+
+# 3) Kayıt + doğrulama maili: yeni (throwaway) kullanıcı kaydı → doğrulama maili log'da mı
+python flow_tests/ticket_cart_flow.py --register-mail
+
+# Yalnızca kapıları (güvenlik + login + profil) çalıştır, akışa girme:
+python flow_tests/ticket_cart_flow.py --gates-only
+
+# Görünür yerine başsız (CI):
+python flow_tests/ticket_cart_flow.py --no-headed
+```
+
+| Akış | Ne yapar | "Başarılı" tanımı |
+|---|---|---|
+| **Sepet** (varsayılan) | Giriş → uygun ürünü **dinamik** seçer → sepete ekler → sepette adedi artırır | Her adım DOM'da doğrulanır; console/pageerror/4xx/5xx yok |
+| **Ödeme** (`--pay`) | Sepet akışının devamı → fatura bilgileri → onay → **fake** ödeme sağlayıcısıyla tamamlar | Başarı sayfasına yönlenir + görünür başarı mesajı; gerçek para yok |
+| **Kayıt+mail** (`--register-mail`) | Guest → yeni kullanıcı kaydı → doğrulama maili tetiklenir | Kayıt tamamlanır **ve** doğrulama maili hedefin loguna yazılır (dışarı çıkmadan) |
+
+Selector'lar hedefin **mevcut yapısal** öğelerinden türetilir (form `action`/`name`,
+buton metni, kararlı `id`/attribute); hedefin şablonlarına test-özel işaretleyici
+(`data-testid`) **eklenmez**.
+
+### Tekrarlanabilirlik (teardown)
+
+Her akış temiz başlar ve kalıcı test artığı bırakmaz:
+
+- **Sepet/ödeme:** akış başında test kullanıcısının sepeti, uygulamanın kendi "kaldır"
+  akışıyla temizlenir; ödeme akışında ayrıca test kullanıcısının **yalnızca test
+  kaydına** ait ödenmiş siparişler, **çift koşullu** (kullanıcı + kayıt kimliği) scoped
+  bir temizlikle silinir (bağlı kayıtlar FK cascade ile gider).
+- **Kayıt+mail:** her koşu benzersiz bir `qa-mailtest-{zaman}@qa.local` e-postası üretir;
+  koşu sonunda o kullanıcı **üç kat guard** (prefix + domain + tam eşleşme) ile silinir —
+  gerçek veya başka bir kullanıcıya dokunmak imkânsızdır.
+
+Teardown, hedefin yerel test veritabanında `docker compose exec` ile çalışır; başarısız
+olursa (ör. konteyner ayakta değil) akış körlemesine devam etmez, net bir mesajla durur.
+
 **⚠️ Mac uyku / kapalı durumu:**
 - **Uyanık:** job zamanında çalışır.
 - **Uykuda:** launchd kaçırılan çalışmayı Mac uyanınca **bir kez** çalıştırır
@@ -188,7 +279,11 @@ launchctl unload -w ~/Library/LaunchAgents/com.example.qa-weekly.plist
 - Tüm sırlar `.env`'de tutulur; `.env` gitignore'dadır ve API anahtarı/token
   hiçbir zaman loglanmaz.
 - Tarama bulguları (`reports/`) ve loglar (`logs/`) versiyon kontrolüne girmez.
-- Araç salt-okunurdur: hedef üzerinde durum değiştiren hiçbir işlem yapmaz.
+- **Salt-okunur gezgin** hedef üzerinde durum değiştiren hiçbir işlem yapmaz
+  (yalnızca `GET` + istenirse `/login`).
+- **E2E akışları aktif aksiyon alır**, ama yalnızca güvenli-ortam kapısı geçtiğinde
+  (mail=log, ödeme=fake) çalışır; yalnızca yerel/izole bir hedefte kullanın. Mailler
+  dışarı çıkmaz, ödemeler sahtedir, teardown kapsamı test verisiyle sınırlıdır.
 
 ## Lisans
 
