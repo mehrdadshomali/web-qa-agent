@@ -1,5 +1,10 @@
 # web-qa-agent
 
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)
+![Tested with Playwright](https://img.shields.io/badge/E2E-Playwright-2EAD33.svg)
+![AI](https://img.shields.io/badge/AI-Anthropic%20Claude-D97757.svg)
+
 **AI destekli QA + E2E test ajanı** — herhangi bir web uygulamasına tarayıcı
 üzerinden bağlanır. İki tamamlayıcı yeteneği vardır:
 
